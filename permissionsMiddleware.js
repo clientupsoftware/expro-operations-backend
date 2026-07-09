@@ -6,6 +6,9 @@ function requireRole(...allowedRoles) {
     if (!req.user) {
       return res.status(401).json({ error: 'No autenticado.' });
     }
+    if (req.user.role === 'super') {
+      return next(); // superusuario: permiso total, sin excepciones
+    }
     if (!allowedRoles.includes(req.user.role)) {
       return res.status(403).json({
         error: `Tu rol (${req.user.role}) no tiene permiso para hacer esta accion.`
