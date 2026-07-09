@@ -21,6 +21,24 @@ async function registerRuns(client, assetIds, jobId, source) {
   }
 }
 
+// Resta 1 carrera a cada asset_id (al editar/eliminar una linea que era una carrera)
+async function unregisterRuns(client, assetIds, jobId, source) {
+  for (const assetId of assetIds) {
+    const lastRun = await client.query(
+      `SELECT id FROM asset_runs WHERE asset_id = $1 AND job_id = $2 AND source = $3
+       ORDER BY id DESC LIMIT 1`,
+      [assetId, jobId, source]
+    );
+    if (lastRun.rows.length > 0) {
+      await client.query('DELETE FROM asset_runs WHERE id = $1', [lastRun.rows[0].id]);
+    }
+    await client.query(
+      'UPDATE assets SET cumulative_runs = GREATEST(cumulative_runs - 1, 0) WHERE id = $1',
+      [assetId]
+    );
+  }
+}
+
 // GET /api/time-reports/:jobId - reportes existentes de un job
 router.get('/:jobId', async (req, res) => {
   const result = await pool.query(
@@ -70,10 +88,10 @@ router.get('/on-call/:reportId/lines', async (req, res) => {
 // de la nueva linea (comportamiento pedido: "arrastrar" truck/set de presion entre corridas).
 router.get('/on-call/:reportId/lines/prefill', async (req, res) => {
   const lastLine = await pool.query(
-    'SELECT id FROM time_report_lines WHERE time_report_id = $1 ORDER BY id DESC LIMIT 1',
+    'SELECT id, hasta FROM time_report_lines WHERE time_report_id = $1 ORDER BY id DESC LIMIT 1',
     [req.params.reportId]
   );
-  if (lastLine.rows.length === 0) return res.json({ assets: [] });
+  if (lastLine.rows.length === 0) return res.json({ assets: [], ultima_hasta: null });
 
   const assetsResult = await pool.query(`
     SELECT time_report_line_assets.asset_id, time_report_line_assets.string_label,
@@ -83,7 +101,7 @@ router.get('/on-call/:reportId/lines/prefill', async (req, res) => {
     WHERE time_report_line_id = $1
   `, [lastLine.rows[0].id]);
 
-  res.json({ assets: assetsResult.rows });
+  res.json({ assets: assetsResult.rows, ultima_hasta: lastLine.rows[0].hasta });
 });
 
 // POST /api/time-reports/on-call/:reportId/lines
@@ -149,6 +167,122 @@ router.post('/on-call/:reportId/lines', requireRole('coordinador', 'ingeniero'),
     await client.query('ROLLBACK');
     console.error(err);
     res.status(500).json({ error: 'Error al crear la linea del reporte.' });
+  } finally {
+    client.release();
+  }
+});
+
+// PATCH /api/time-reports/on-call/lines/:lineId - editar una linea existente
+router.patch('/on-call/lines/:lineId', requireRole('coordinador', 'ingeniero'), async (req, res) => {
+  const { lineId } = req.params;
+  const {
+    fecha, desde, hasta, actividad, operacion, evento_misrun,
+    profundidad_desde, profundidad_hasta, comentarios, is_run, asset_ids
+  } = req.body;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const existing = await client.query(
+      `SELECT time_report_lines.*, time_reports.job_id
+       FROM time_report_lines
+       JOIN time_reports ON time_reports.id = time_report_lines.time_report_id
+       WHERE time_report_lines.id = $1`,
+      [lineId]
+    );
+    if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Linea no encontrada.' });
+    }
+    const oldLine = existing.rows[0];
+
+    const oldAssetsResult = await client.query(
+      'SELECT asset_id FROM time_report_line_assets WHERE time_report_line_id = $1',
+      [lineId]
+    );
+    const oldAssetIds = oldAssetsResult.rows.map((r) => r.asset_id);
+    const newAssetIds = Array.isArray(asset_ids) ? asset_ids.map((a) => a.asset_id) : oldAssetIds;
+    const newIsRun = is_run !== undefined ? is_run : oldLine.is_run;
+
+    // Ajustar contador de carreras segun lo que cambio
+    const oldCounted = oldLine.is_run ? oldAssetIds : [];
+    const newCounted = newIsRun ? newAssetIds : [];
+    const toRemove = oldCounted.filter((id) => !newCounted.includes(id));
+    const toAdd = newCounted.filter((id) => !oldCounted.includes(id));
+    if (toRemove.length > 0) await unregisterRuns(client, toRemove, oldLine.job_id, 'on_call_line');
+    if (toAdd.length > 0) await registerRuns(client, toAdd, oldLine.job_id, 'on_call_line');
+
+    const updated = await client.query(
+      `UPDATE time_report_lines SET
+         fecha = $1, desde = $2, hasta = $3, actividad = $4, operacion = $5,
+         evento_misrun = $6, profundidad_desde = $7, profundidad_hasta = $8,
+         comentarios = $9, is_run = $10
+       WHERE id = $11 RETURNING *`,
+      [fecha, desde, hasta, actividad, operacion, evento_misrun || false,
+       profundidad_desde || null, profundidad_hasta || null, comentarios || null,
+       newIsRun, lineId]
+    );
+
+    if (Array.isArray(asset_ids)) {
+      await client.query('DELETE FROM time_report_line_assets WHERE time_report_line_id = $1', [lineId]);
+      for (const item of asset_ids) {
+        await client.query(
+          'INSERT INTO time_report_line_assets (time_report_line_id, asset_id, string_label) VALUES ($1, $2, $3)',
+          [lineId, item.asset_id, item.string_label || null]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json(updated.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al editar la linea.' });
+  } finally {
+    client.release();
+  }
+});
+
+// DELETE /api/time-reports/on-call/lines/:lineId
+router.delete('/on-call/lines/:lineId', requireRole('coordinador', 'ingeniero'), async (req, res) => {
+  const { lineId } = req.params;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const existing = await client.query(
+      `SELECT time_report_lines.*, time_reports.job_id
+       FROM time_report_lines
+       JOIN time_reports ON time_reports.id = time_report_lines.time_report_id
+       WHERE time_report_lines.id = $1`,
+      [lineId]
+    );
+    if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Linea no encontrada.' });
+    }
+    const line = existing.rows[0];
+
+    if (line.is_run) {
+      const assetsResult = await client.query(
+        'SELECT asset_id FROM time_report_line_assets WHERE time_report_line_id = $1',
+        [lineId]
+      );
+      const assetIds = assetsResult.rows.map((r) => r.asset_id);
+      if (assetIds.length > 0) await unregisterRuns(client, assetIds, line.job_id, 'on_call_line');
+    }
+
+    await client.query('DELETE FROM time_report_lines WHERE id = $1', [lineId]); // cascade borra los assets de la linea
+
+    await client.query('COMMIT');
+    res.status(204).send();
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al eliminar la linea.' });
   } finally {
     client.release();
   }
