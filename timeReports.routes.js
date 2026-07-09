@@ -1,4 +1,5 @@
 const express = require('express');
+const path = require('path');
 const pool = require('./db');
 const { requireAuth } = require('./authMiddleware');
 const { requireRole } = require('./permissionsMiddleware');
@@ -289,8 +290,8 @@ function computeIntervalo(desde, hasta) {
   return 0;
 }
 
-// GET /api/time-reports/on-call/:reportId/export - descarga el .xlsx con el formato real
-// (Wireline Daily Operations Report)
+// GET /api/time-reports/on-call/:reportId/export - descarga el .xlsx con el formato real de Expro
+// Usa template_on_call.xlsx (tu plantilla real) como base y solo completa los datos.
 router.get('/on-call/:reportId/export', async (req, res) => {
   const ExcelJS = require('exceljs');
   const { reportId } = req.params;
@@ -323,66 +324,51 @@ router.get('/on-call/:reportId/export', async (req, res) => {
   const misrunCount = linesResult.rows.filter((l) => l.evento_misrun).length;
 
   const workbook = new ExcelJS.Workbook();
-  const sheet = workbook.addWorksheet('RT');
+  await workbook.xlsx.readFile(path.join(__dirname, 'template_on_call.xlsx'));
+  const sheet = workbook.getWorksheet('BIF');
 
-  const bold = { bold: true };
-  function set(coord, value, opts = {}) {
-    const cell = sheet.getCell(coord);
-    cell.value = value;
-    if (opts.bold) cell.font = bold;
-    if (opts.numFmt) cell.numFmt = opts.numFmt;
+  function set(coord, value) {
+    sheet.getCell(coord).value = value === undefined ? null : value;
   }
 
-  set('G2', 'Wireline Daily Operations Report', { bold: true });
-  set('B4', 'Global - Well Intervention', { bold: true });
+  set('E6', report.rig_name);
+  set('K6', pozoNombre);
+  set('N6', report.created_at);
 
-  set('B6', 'Rig Name'); set('E6', report.rig_name);
-  set('J6', 'Well Name/Number'); set('K6', pozoNombre);
-  set('M6', 'Report Date'); set('N6', report.created_at, { numFmt: 'dd/mm/yyyy' });
+  set('E8', report.well_status);
+  set('K8', report.shut_in_tubing_pressure);
 
-  set('B8', 'Well status'); set('E8', report.well_status);
-  set('J8', 'Shut In Tubing Pressure'); set('K8', report.shut_in_tubing_pressure);
-  set('M8', 'Shut In Casing Pressure');
+  set('E10', report.flowing_thp);
+  set('E12', report.job_objective || report.service_name);
+  set('E14', report.representante_cliente);
 
-  set('B10', 'Flowing Tubing Head Pressure'); set('E10', report.flowing_thp);
-  set('I10', 'Well Head Condition');
-  set('M10', 'Ticket Num');
+  set('J15', report.supervisor_dia); set('M15', report.supervisor_noche);
+  set('J16', report.guinchero_dia); set('M16', report.guinchero_noche);
+  set('J17', report.asistente_dia); set('M17', report.asistente_noche);
 
-  set('B12', 'Job Objective'); set('E12', report.job_objective || report.service_name);
-  set('M12', 'Contract Number');
+  set('B18', `JOB SUMMARY: ${report.job_objective || report.service_name || ''}`);
+  set('B19', `Unidad Liviana: ${report.unidad_liviana || '-'}      Unidad de carga: ${report.unidad_carga || '-'}      Unidad de WL: ${report.unidad_wl || '-'}`);
 
-  set('B14', 'Client Company Man'); set('E14', report.representante_cliente);
-  set('J14', 'Note:'); set('K14', 'Specific Depth and Pressure Units used should be entered where applicable.');
+  // La tabla de lineas ocupa las filas 23 a 46 en la plantilla (24 lineas).
+  // Si el reporte tiene mas lineas, se duplican filas con el mismo estilo antes del pie,
+  // para no pisar la parte de firmas/consumibles. Esto corre el pie hacia abajo, por eso
+  // las celdas del pie se calculan con el offset "extraRows".
+  const TABLE_FIRST_ROW = 23;
+  const TABLE_LAST_ROW = 46;
+  const availableRows = TABLE_LAST_ROW - TABLE_FIRST_ROW + 1;
+  let extraRows = 0;
+  if (linesResult.rows.length > availableRows) {
+    extraRows = linesResult.rows.length - availableRows;
+    sheet.duplicateRow(TABLE_LAST_ROW, extraRows, true);
+  }
 
-  set('B15', 'Completion Supervisor'); set('H15', 'W/L Supervisor (Day)'); set('J15', report.supervisor_dia);
-  set('L15', 'W/L Supervisor (Night)'); set('M15', report.supervisor_noche);
-  set('B16', 'Senior Technician (Day)'); set('H16', 'W/L Operator (Day)'); set('J16', report.guinchero_dia);
-  set('L16', 'W/L Operator (Night)'); set('M16', report.guinchero_noche);
-  set('B17', 'Senior Technician (Night)'); set('H17', 'W/L Assistant (Day)'); set('J17', report.asistente_dia);
-  set('L17', 'W/L Assistant (Night)'); set('M17', report.asistente_noche);
-
-  set('B18', `JOB SUMMARY: ${report.job_objective || report.service_name || ''}`, { bold: true });
-
-  const unidadesLine = `Unidad Liviana: ${report.unidad_liviana || '-'}      Unidad de carga: ${report.unidad_carga || '-'}      Unidad de WL: ${report.unidad_wl || '-'}`;
-  set('B19', unidadesLine);
-
-  set('C22', 'FROM', { bold: true });
-  set('D22', 'TO', { bold: true });
-  set('E22', 'TIME', { bold: true });
-  set('F22', 'THP', { bold: true });
-  set('G22', 'Fluid Level', { bold: true });
-  set('H22', 'COMMENTS', { bold: true });
-  set('M22', 'Weight (lbs)', { bold: true });
-  set('N22', 'Depth & Reference Point', { bold: true });
-
-  let rowIndex = 23;
+  let rowIndex = TABLE_FIRST_ROW;
   let lastFecha = null;
   for (const line of linesResult.rows) {
     const fechaStr = line.fecha ? new Date(line.fecha).toISOString().slice(0, 10) : null;
     const row = sheet.getRow(rowIndex);
     if (fechaStr !== lastFecha) {
       row.getCell(2).value = line.fecha; // B
-      row.getCell(2).numFmt = 'dd/mm/yyyy';
       lastFecha = fechaStr;
     }
     row.getCell(3).value = line.desde;  // C
@@ -397,38 +383,11 @@ router.get('/on-call/:reportId/export', async (req, res) => {
     rowIndex += 1;
   }
 
-  const footerStart = rowIndex + 2;
-  set(`B${footerStart}`, 'Winch WLS Number'); set(`H${footerStart}`, 'Mast WLS Number');
-  set(`J${footerStart}`, 'Daily Number of Runs'); set(`L${footerStart}`, 'Accumulative Wire Distance Run (m)');
-
-  set(`B${footerStart + 2}`, 'Power Pack WLS Number'); set(`E${footerStart + 2}`, report.power_pack);
-  set(`H${footerStart + 2}`, 'BOP WLS Number');
-  set(`J${footerStart + 2}`, 'Mis-runs'); set(`K${footerStart + 2}`, misrunCount);
-  set(`L${footerStart + 2}`, 'Daily Wire Hrs.');
-
-  set(`B${footerStart + 4}`, 'Wire Type & Size'); set(`E${footerStart + 4}`, report.wire_type_size);
-  set(`H${footerStart + 4}`, 'Rear Wire Drum Number');
-  set(`J${footerStart + 4}`, 'Max Drag (lbs)'); set(`L${footerStart + 4}`, 'Accumulative Wire Runs during Operation');
-
-  set(`B${footerStart + 6}`, 'Wrap / Twist Test Turns Achieved'); set(`H${footerStart + 6}`, 'Front Wire Drum Number');
-  set(`J${footerStart + 6}`, 'Max Drag Depth'); set(`L${footerStart + 6}`, 'Accumulative Wireline Hours during operation');
-
-  set(`B${footerStart + 8}`, 'Wire Length Discarded'); set(`L${footerStart + 8}`, 'Accumulative Engine Hours During operation.');
-  set(`B${footerStart + 10}`, "Wire length remaining on drum after cut off's");
-
-  set(`B${footerStart + 12}`, 'Consumables Used:'); set(`E${footerStart + 12}`, report.consumables_used);
-  set(`B${footerStart + 13}`, 'Positive Intervention Cards:');
-
-  set(`B${footerStart + 14}`, 'Client Representative', { bold: true });
-  set(`I${footerStart + 14}`, 'Expro Representative', { bold: true });
-  set(`E${footerStart + 16}`, report.representante_cliente);
-  set(`L${footerStart + 16}`, report.expro_representante);
-  set(`D${footerStart + 17}`, 'Name:'); set(`J${footerStart + 17}`, 'Name:');
-  set(`D${footerStart + 19}`, 'Signature:'); set(`K${footerStart + 19}`, 'Signature:');
-  set(`D${footerStart + 21}`, 'Date:'); set(`K${footerStart + 21}`, 'Date:');
-
-  sheet.columns.forEach((col) => { col.width = 15; });
-  sheet.getColumn(8).width = 45; // H: comentarios/narrativa
+  set(`E${52 + extraRows}`, report.wire_type_size);
+  set(`K${50 + extraRows}`, misrunCount); // Mis-runs
+  set(`E${60 + extraRows}`, report.consumables_used);
+  set(`E${64 + extraRows}`, report.representante_cliente);
+  set(`L${64 + extraRows}`, report.expro_representante);
 
   const pozoParaNombre = pozoNombre.split(',')[0] || 'job';
   const filename = `Reporte_de_tiempos-${pozoParaNombre}.xlsx`.replace(/[^a-zA-Z0-9_.-]/g, '');
