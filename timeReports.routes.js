@@ -238,4 +238,205 @@ router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'),
   }
 });
 
+// ================= ENCABEZADO (para que la exportacion a Excel salga completa) =================
+
+const HEADER_FIELDS = [
+  'rig_name', 'well_status', 'shut_in_tubing_pressure', 'flowing_thp', 'job_objective',
+  'representante_cliente', 'expro_representante',
+  'supervisor_dia', 'guinchero_dia', 'asistente_dia',
+  'supervisor_noche', 'guinchero_noche', 'asistente_noche',
+  'unidad_liviana', 'unidad_carga', 'unidad_wl',
+  'numero_wls', 'power_pack', 'wire_type_size', 'consumables_used'
+];
+
+// PATCH /api/time-reports/:reportId/header - guarda los datos de encabezado (opcionales)
+router.patch('/:reportId/header', requireRole('coordinador', 'ingeniero'), async (req, res) => {
+  const setClauses = [];
+  const values = [];
+  HEADER_FIELDS.forEach((field) => {
+    if (field in req.body) {
+      values.push(req.body[field] || null);
+      setClauses.push(`${field} = $${values.length}`);
+    }
+  });
+  if (setClauses.length === 0) return res.status(400).json({ error: 'Nada para actualizar.' });
+
+  values.push(req.params.reportId);
+  const result = await pool.query(
+    `UPDATE time_reports SET ${setClauses.join(', ')} WHERE id = $${values.length} RETURNING *`,
+    values
+  );
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Reporte no encontrado.' });
+  res.json(result.rows[0]);
+});
+
+// ================= EXPORTAR A EXCEL (formato real On Call) =================
+
+function toHoursDecimal(desde, hasta) {
+  if (!desde || !hasta) return null;
+  const [h1, m1] = desde.split(':').map(Number);
+  const [h2, m2] = hasta.split(':').map(Number);
+  let minutes = (h2 * 60 + m2) - (h1 * 60 + m1);
+  if (minutes < 0) minutes += 24 * 60; // cruza medianoche
+  return Math.round((minutes / 60) * 100) / 100;
+}
+
+function computeIntervalo(desde, hasta) {
+  const d = desde !== null && desde !== undefined ? Number(desde) : null;
+  const h = hasta !== null && hasta !== undefined ? Number(hasta) : null;
+  if (d !== null && h !== null) return Math.abs(d - h);
+  if (d !== null) return d;
+  return 0;
+}
+
+// GET /api/time-reports/on-call/:reportId/export - descarga el .xlsx con el formato real
+// (Wireline Daily Operations Report)
+router.get('/on-call/:reportId/export', async (req, res) => {
+  const ExcelJS = require('exceljs');
+  const { reportId } = req.params;
+
+  const reportResult = await pool.query(`
+    SELECT time_reports.*, jobs.job_number,
+           clients.name AS client_name, pads.name AS pad_name, services.name AS service_name
+    FROM time_reports
+    JOIN jobs ON jobs.id = time_reports.job_id
+    JOIN pads ON pads.id = jobs.pad_id
+    JOIN clients ON clients.id = pads.client_id
+    JOIN services ON services.id = jobs.service_id
+    WHERE time_reports.id = $1
+  `, [reportId]);
+  if (reportResult.rows.length === 0) return res.status(404).json({ error: 'Reporte no encontrado.' });
+  const report = reportResult.rows[0];
+
+  const wellsResult = await pool.query(`
+    SELECT wells.name FROM wells
+    JOIN job_wells ON job_wells.well_id = wells.id
+    WHERE job_wells.job_id = $1
+  `, [report.job_id]);
+  const pozoNombre = wellsResult.rows.map((w) => w.name).join(', ');
+
+  const linesResult = await pool.query(
+    'SELECT * FROM time_report_lines WHERE time_report_id = $1 ORDER BY id',
+    [reportId]
+  );
+
+  const misrunCount = linesResult.rows.filter((l) => l.evento_misrun).length;
+
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('RT');
+
+  const bold = { bold: true };
+  function set(coord, value, opts = {}) {
+    const cell = sheet.getCell(coord);
+    cell.value = value;
+    if (opts.bold) cell.font = bold;
+    if (opts.numFmt) cell.numFmt = opts.numFmt;
+  }
+
+  set('G2', 'Wireline Daily Operations Report', { bold: true });
+  set('B4', 'Global - Well Intervention', { bold: true });
+
+  set('B6', 'Rig Name'); set('E6', report.rig_name);
+  set('J6', 'Well Name/Number'); set('K6', pozoNombre);
+  set('M6', 'Report Date'); set('N6', report.created_at, { numFmt: 'dd/mm/yyyy' });
+
+  set('B8', 'Well status'); set('E8', report.well_status);
+  set('J8', 'Shut In Tubing Pressure'); set('K8', report.shut_in_tubing_pressure);
+  set('M8', 'Shut In Casing Pressure');
+
+  set('B10', 'Flowing Tubing Head Pressure'); set('E10', report.flowing_thp);
+  set('I10', 'Well Head Condition');
+  set('M10', 'Ticket Num');
+
+  set('B12', 'Job Objective'); set('E12', report.job_objective || report.service_name);
+  set('M12', 'Contract Number');
+
+  set('B14', 'Client Company Man'); set('E14', report.representante_cliente);
+  set('J14', 'Note:'); set('K14', 'Specific Depth and Pressure Units used should be entered where applicable.');
+
+  set('B15', 'Completion Supervisor'); set('H15', 'W/L Supervisor (Day)'); set('J15', report.supervisor_dia);
+  set('L15', 'W/L Supervisor (Night)'); set('M15', report.supervisor_noche);
+  set('B16', 'Senior Technician (Day)'); set('H16', 'W/L Operator (Day)'); set('J16', report.guinchero_dia);
+  set('L16', 'W/L Operator (Night)'); set('M16', report.guinchero_noche);
+  set('B17', 'Senior Technician (Night)'); set('H17', 'W/L Assistant (Day)'); set('J17', report.asistente_dia);
+  set('L17', 'W/L Assistant (Night)'); set('M17', report.asistente_noche);
+
+  set('B18', `JOB SUMMARY: ${report.job_objective || report.service_name || ''}`, { bold: true });
+
+  const unidadesLine = `Unidad Liviana: ${report.unidad_liviana || '-'}      Unidad de carga: ${report.unidad_carga || '-'}      Unidad de WL: ${report.unidad_wl || '-'}`;
+  set('B19', unidadesLine);
+
+  set('C22', 'FROM', { bold: true });
+  set('D22', 'TO', { bold: true });
+  set('E22', 'TIME', { bold: true });
+  set('F22', 'THP', { bold: true });
+  set('G22', 'Fluid Level', { bold: true });
+  set('H22', 'COMMENTS', { bold: true });
+  set('M22', 'Weight (lbs)', { bold: true });
+  set('N22', 'Depth & Reference Point', { bold: true });
+
+  let rowIndex = 23;
+  let lastFecha = null;
+  for (const line of linesResult.rows) {
+    const fechaStr = line.fecha ? new Date(line.fecha).toISOString().slice(0, 10) : null;
+    const row = sheet.getRow(rowIndex);
+    if (fechaStr !== lastFecha) {
+      row.getCell(2).value = line.fecha; // B
+      row.getCell(2).numFmt = 'dd/mm/yyyy';
+      lastFecha = fechaStr;
+    }
+    row.getCell(3).value = line.desde;  // C
+    row.getCell(4).value = line.hasta;  // D
+    row.getCell(5).value = toHoursDecimal(line.desde, line.hasta); // E
+    row.getCell(8).value = line.comentarios || [line.actividad, line.operacion].filter(Boolean).join(' - '); // H
+    if (line.profundidad_desde !== null || line.profundidad_hasta !== null) {
+      const desdeTxt = line.profundidad_desde !== null ? `DESDE ${line.profundidad_desde} m` : '';
+      const hastaTxt = line.profundidad_hasta !== null ? `HASTA ${line.profundidad_hasta} m` : '';
+      row.getCell(14).value = [desdeTxt, hastaTxt].filter(Boolean).join(' '); // N
+    }
+    rowIndex += 1;
+  }
+
+  const footerStart = rowIndex + 2;
+  set(`B${footerStart}`, 'Winch WLS Number'); set(`H${footerStart}`, 'Mast WLS Number');
+  set(`J${footerStart}`, 'Daily Number of Runs'); set(`L${footerStart}`, 'Accumulative Wire Distance Run (m)');
+
+  set(`B${footerStart + 2}`, 'Power Pack WLS Number'); set(`E${footerStart + 2}`, report.power_pack);
+  set(`H${footerStart + 2}`, 'BOP WLS Number');
+  set(`J${footerStart + 2}`, 'Mis-runs'); set(`K${footerStart + 2}`, misrunCount);
+  set(`L${footerStart + 2}`, 'Daily Wire Hrs.');
+
+  set(`B${footerStart + 4}`, 'Wire Type & Size'); set(`E${footerStart + 4}`, report.wire_type_size);
+  set(`H${footerStart + 4}`, 'Rear Wire Drum Number');
+  set(`J${footerStart + 4}`, 'Max Drag (lbs)'); set(`L${footerStart + 4}`, 'Accumulative Wire Runs during Operation');
+
+  set(`B${footerStart + 6}`, 'Wrap / Twist Test Turns Achieved'); set(`H${footerStart + 6}`, 'Front Wire Drum Number');
+  set(`J${footerStart + 6}`, 'Max Drag Depth'); set(`L${footerStart + 6}`, 'Accumulative Wireline Hours during operation');
+
+  set(`B${footerStart + 8}`, 'Wire Length Discarded'); set(`L${footerStart + 8}`, 'Accumulative Engine Hours During operation.');
+  set(`B${footerStart + 10}`, "Wire length remaining on drum after cut off's");
+
+  set(`B${footerStart + 12}`, 'Consumables Used:'); set(`E${footerStart + 12}`, report.consumables_used);
+  set(`B${footerStart + 13}`, 'Positive Intervention Cards:');
+
+  set(`B${footerStart + 14}`, 'Client Representative', { bold: true });
+  set(`I${footerStart + 14}`, 'Expro Representative', { bold: true });
+  set(`E${footerStart + 16}`, report.representante_cliente);
+  set(`L${footerStart + 16}`, report.expro_representante);
+  set(`D${footerStart + 17}`, 'Name:'); set(`J${footerStart + 17}`, 'Name:');
+  set(`D${footerStart + 19}`, 'Signature:'); set(`K${footerStart + 19}`, 'Signature:');
+  set(`D${footerStart + 21}`, 'Date:'); set(`K${footerStart + 21}`, 'Date:');
+
+  sheet.columns.forEach((col) => { col.width = 15; });
+  sheet.getColumn(8).width = 45; // H: comentarios/narrativa
+
+  const pozoParaNombre = pozoNombre.split(',')[0] || 'job';
+  const filename = `Reporte_de_tiempos-${pozoParaNombre}.xlsx`.replace(/[^a-zA-Z0-9_.-]/g, '');
+
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  await workbook.xlsx.write(res);
+  res.end();
+});
+
 module.exports = router;
