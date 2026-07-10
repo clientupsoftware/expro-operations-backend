@@ -14,17 +14,20 @@ router.get('/', async (req, res) => {
       jobs.id, jobs.job_number, jobs.status, jobs.created_at,
       pads.name AS pad_name,
       clients.name AS client_name,
-      services.name AS service_name,
+      COALESCE(
+        json_agg(DISTINCT services.name) FILTER (WHERE services.name IS NOT NULL), '[]'
+      ) AS services,
       COALESCE(
         json_agg(DISTINCT wells.name) FILTER (WHERE wells.name IS NOT NULL), '[]'
       ) AS wells
     FROM jobs
     JOIN pads ON pads.id = jobs.pad_id
     JOIN clients ON clients.id = pads.client_id
-    JOIN services ON services.id = jobs.service_id
+    LEFT JOIN job_services ON job_services.job_id = jobs.id
+    LEFT JOIN services ON services.id = job_services.service_id
     LEFT JOIN job_wells ON job_wells.job_id = jobs.id
     LEFT JOIN wells ON wells.id = job_wells.well_id
-    GROUP BY jobs.id, pads.name, clients.name, services.name
+    GROUP BY jobs.id, pads.name, clients.name
     ORDER BY jobs.created_at DESC
   `);
   res.json(result.rows);
@@ -34,12 +37,10 @@ router.get('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
   const { id } = req.params;
   const jobResult = await pool.query(`
-    SELECT
-      jobs.*, pads.name AS pad_name, clients.name AS client_name, services.name AS service_name
+    SELECT jobs.*, pads.name AS pad_name, clients.name AS client_name
     FROM jobs
     JOIN pads ON pads.id = jobs.pad_id
     JOIN clients ON clients.id = pads.client_id
-    JOIN services ON services.id = jobs.service_id
     WHERE jobs.id = $1
   `, [id]);
 
@@ -51,31 +52,37 @@ router.get('/:id', async (req, res) => {
     WHERE job_wells.job_id = $1
   `, [id]);
 
-  res.json({ ...jobResult.rows[0], wells: wellsResult.rows });
+  const servicesResult = await pool.query(`
+    SELECT services.* FROM services
+    JOIN job_services ON job_services.service_id = services.id
+    WHERE job_services.job_id = $1
+  `, [id]);
+
+  res.json({ ...jobResult.rows[0], wells: wellsResult.rows, services: servicesResult.rows });
 });
 
-// POST /api/jobs - crear Job (solo Coordinador). well_ids es un array (uno o varios pozos del PAD)
+// POST /api/jobs - crear Job (solo Coordinador). well_ids y service_ids son arrays
 router.post('/', requireRole('coordinador'), async (req, res) => {
-  const { pad_id, service_id, well_ids, job_number } = req.body;
-  if (!pad_id || !service_id || !Array.isArray(well_ids) || well_ids.length === 0) {
-    return res.status(400).json({ error: 'pad_id, service_id y well_ids (array) son requeridos.' });
+  const { pad_id, service_ids, well_ids, job_number } = req.body;
+  if (!pad_id || !Array.isArray(service_ids) || service_ids.length === 0 || !Array.isArray(well_ids) || well_ids.length === 0) {
+    return res.status(400).json({ error: 'pad_id, service_ids (array) y well_ids (array) son requeridos.' });
   }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const jobResult = await client.query(
-      `INSERT INTO jobs (pad_id, service_id, job_number, created_by)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [pad_id, service_id, job_number || null, req.user.id]
+      `INSERT INTO jobs (pad_id, job_number, created_by)
+       VALUES ($1, $2, $3) RETURNING *`,
+      [pad_id, job_number || null, req.user.id]
     );
     const job = jobResult.rows[0];
 
     for (const wellId of well_ids) {
-      await client.query(
-        'INSERT INTO job_wells (job_id, well_id) VALUES ($1, $2)',
-        [job.id, wellId]
-      );
+      await client.query('INSERT INTO job_wells (job_id, well_id) VALUES ($1, $2)', [job.id, wellId]);
+    }
+    for (const serviceId of service_ids) {
+      await client.query('INSERT INTO job_services (job_id, service_id) VALUES ($1, $2)', [job.id, serviceId]);
     }
 
     await client.query('COMMIT');

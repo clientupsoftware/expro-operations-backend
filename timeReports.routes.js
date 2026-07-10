@@ -432,13 +432,18 @@ router.get('/on-call/:reportId/export', async (req, res) => {
 
   const reportResult = await pool.query(`
     SELECT time_reports.*, jobs.job_number,
-           clients.name AS client_name, pads.name AS pad_name, services.name AS service_name
+           clients.name AS client_name, pads.name AS pad_name,
+           COALESCE(
+             string_agg(DISTINCT services.name, ', '), ''
+           ) AS service_name
     FROM time_reports
     JOIN jobs ON jobs.id = time_reports.job_id
     JOIN pads ON pads.id = jobs.pad_id
     JOIN clients ON clients.id = pads.client_id
-    JOIN services ON services.id = jobs.service_id
+    LEFT JOIN job_services ON job_services.job_id = jobs.id
+    LEFT JOIN services ON services.id = job_services.service_id
     WHERE time_reports.id = $1
+    GROUP BY time_reports.id, jobs.job_number, clients.name, pads.name
   `, [reportId]);
   if (reportResult.rows.length === 0) return res.status(404).json({ error: 'Reporte no encontrado.' });
   const report = reportResult.rows[0];
