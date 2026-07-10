@@ -6,6 +6,7 @@ const authRoutes = require('./auth.routes');
 const catalogRoutes = require('./catalog.routes');
 const jobsRoutes = require('./jobs.routes');
 const dailyBoardRoutes = require('./dailyBoard.routes');
+const operacionOptionsRoutes = require('./operacionOptions.routes');
 const assetsRoutes = require('./assets.routes');
 const kitsRoutes = require('./kits.routes');
 const jobAssetsRoutes = require('./jobAssets.routes');
@@ -27,6 +28,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api', catalogRoutes);           // /api/clients, /api/pads, /api/wells, /api/services
 app.use('/api/jobs', jobsRoutes);
 app.use('/api/daily-board', dailyBoardRoutes);
+app.use('/api/time-report-operations', operacionOptionsRoutes);
 app.use('/api/assets', assetsRoutes);
 app.use('/api/kits', kitsRoutes);
 app.use('/api/job-assets', jobAssetsRoutes);
