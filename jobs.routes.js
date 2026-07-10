@@ -37,7 +37,7 @@ router.get('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
   const { id } = req.params;
   const jobResult = await pool.query(`
-    SELECT jobs.*, pads.name AS pad_name, clients.name AS client_name
+    SELECT jobs.*, pads.name AS pad_name, pads.client_id AS client_id, clients.name AS client_name
     FROM jobs
     JOIN pads ON pads.id = jobs.pad_id
     JOIN clients ON clients.id = pads.client_id
@@ -58,7 +58,71 @@ router.get('/:id', async (req, res) => {
     WHERE job_services.job_id = $1
   `, [id]);
 
-  res.json({ ...jobResult.rows[0], wells: wellsResult.rows, services: servicesResult.rows });
+  const peripheralsResult = await pool.query(`
+    SELECT job_peripheral_options.* FROM job_peripheral_options
+    JOIN job_peripherals ON job_peripherals.option_id = job_peripheral_options.id
+    WHERE job_peripherals.job_id = $1
+  `, [id]);
+
+  res.json({
+    ...jobResult.rows[0],
+    wells: wellsResult.rows,
+    services: servicesResult.rows,
+    peripherals: peripheralsResult.rows
+  });
+});
+
+// PATCH /api/jobs/:id/details - edicion completa (Coordinador/Super): PAD, pozos, servicios,
+// presion en BDP, perifericos y doble dotacion.
+router.patch('/:id/details', requireRole('coordinador'), async (req, res) => {
+  const { id } = req.params;
+  const { pad_id, well_ids, service_ids, presion_bdp, doble_dotacion, peripheral_ids } = req.body;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const setClauses = [];
+    const values = [];
+    if (pad_id !== undefined) { values.push(pad_id); setClauses.push(`pad_id = $${values.length}`); }
+    if (presion_bdp !== undefined) { values.push(presion_bdp === '' ? null : presion_bdp); setClauses.push(`presion_bdp = $${values.length}`); }
+    if (doble_dotacion !== undefined) { values.push(doble_dotacion || 'NA'); setClauses.push(`doble_dotacion = $${values.length}`); }
+    if (setClauses.length > 0) {
+      values.push(id);
+      await client.query(`UPDATE jobs SET ${setClauses.join(', ')}, updated_at = now() WHERE id = $${values.length}`, values);
+    }
+
+    if (Array.isArray(well_ids)) {
+      await client.query('DELETE FROM job_wells WHERE job_id = $1', [id]);
+      for (const wellId of well_ids) {
+        await client.query('INSERT INTO job_wells (job_id, well_id) VALUES ($1, $2)', [id, wellId]);
+      }
+    }
+
+    if (Array.isArray(service_ids)) {
+      await client.query('DELETE FROM job_services WHERE job_id = $1', [id]);
+      for (const serviceId of service_ids) {
+        await client.query('INSERT INTO job_services (job_id, service_id) VALUES ($1, $2)', [id, serviceId]);
+      }
+    }
+
+    if (Array.isArray(peripheral_ids)) {
+      await client.query('DELETE FROM job_peripherals WHERE job_id = $1', [id]);
+      for (const optId of peripheral_ids) {
+        await client.query('INSERT INTO job_peripherals (job_id, option_id) VALUES ($1, $2)', [id, optId]);
+      }
+    }
+
+    await client.query('COMMIT');
+    const updated = await pool.query('SELECT * FROM jobs WHERE id = $1', [id]);
+    res.json(updated.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al actualizar los detalles del job.' });
+  } finally {
+    client.release();
+  }
 });
 
 // POST /api/jobs - crear Job (solo Coordinador). well_ids y service_ids son arrays
