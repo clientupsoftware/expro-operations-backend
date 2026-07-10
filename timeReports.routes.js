@@ -458,6 +458,16 @@ router.get('/on-call/:reportId/export', async (req, res) => {
   if (reportResult.rows.length === 0) return res.status(404).json({ error: 'Reporte no encontrado.' });
   const report = reportResult.rows[0];
 
+  const jobHeaderResult = await pool.query('SELECT * FROM jobs WHERE id = $1', [report.job_id]);
+  const jobHeader = jobHeaderResult.rows[0] || {};
+
+  // El reporte puede pisar el dato del Job (si el ingeniero lo edito ahi); si no, se usa el default del Job.
+  function val(field) {
+    const reportValue = report[field];
+    if (reportValue !== null && reportValue !== undefined && reportValue !== '') return reportValue;
+    return jobHeader[field];
+  }
+
   const wellsResult = await pool.query(`
     SELECT wells.name FROM wells
     JOIN job_wells ON job_wells.well_id = wells.id
@@ -480,23 +490,23 @@ router.get('/on-call/:reportId/export', async (req, res) => {
     sheet.getCell(coord).value = value === undefined ? null : value;
   }
 
-  set('E6', report.rig_name);
+  set('E6', val('rig_name'));
   set('K6', pozoNombre);
   set('N6', report.created_at);
 
-  set('E8', report.well_status);
-  set('K8', report.shut_in_tubing_pressure);
+  set('E8', val('well_status'));
+  set('K8', val('shut_in_tubing_pressure'));
 
-  set('E10', report.flowing_thp);
-  set('E12', report.job_objective || report.service_name);
-  set('E14', report.representante_cliente);
+  set('E10', val('flowing_thp'));
+  set('E12', val('job_objective') || report.service_name);
+  set('E14', val('representante_cliente'));
 
-  set('J15', report.supervisor_dia); set('M15', report.supervisor_noche);
-  set('J16', report.guinchero_dia); set('M16', report.guinchero_noche);
-  set('J17', report.asistente_dia); set('M17', report.asistente_noche);
+  set('J15', val('supervisor_dia')); set('M15', val('supervisor_noche'));
+  set('J16', val('guinchero_dia')); set('M16', val('guinchero_noche'));
+  set('J17', val('asistente_dia')); set('M17', val('asistente_noche'));
 
-  set('B18', `JOB SUMMARY: ${report.job_objective || report.service_name || ''}`);
-  set('B19', `Unidad Liviana: ${report.unidad_liviana || '-'}      Unidad de carga: ${report.unidad_carga || '-'}      Unidad de WL: ${report.unidad_wl || '-'}`);
+  set('B18', `JOB SUMMARY: ${val('job_objective') || report.service_name || ''}`);
+  set('B19', `Unidad Liviana: ${val('unidad_liviana') || '-'}      Unidad de carga: ${val('unidad_carga') || '-'}      Unidad de WL: ${val('unidad_wl') || '-'}`);
 
   // La tabla de lineas ocupa las filas 23 a 46 en la plantilla (24 lineas).
   // Si el reporte tiene mas lineas, se duplican filas con el mismo estilo antes del pie,
@@ -532,11 +542,11 @@ router.get('/on-call/:reportId/export', async (req, res) => {
     rowIndex += 1;
   }
 
-  set(`E${52 + extraRows}`, report.wire_type_size);
+  set(`E${52 + extraRows}`, val('wire_type_size'));
   set(`K${50 + extraRows}`, misrunCount); // Mis-runs
-  set(`E${60 + extraRows}`, report.consumables_used);
-  set(`E${64 + extraRows}`, report.representante_cliente);
-  set(`L${64 + extraRows}`, report.expro_representante);
+  set(`E${60 + extraRows}`, val('consumables_used'));
+  set(`E${64 + extraRows}`, val('representante_cliente'));
+  set(`L${64 + extraRows}`, val('expro_representante'));
 
   const pozoParaNombre = pozoNombre.split(',')[0] || 'job';
   const filename = `Reporte_de_tiempos-${pozoParaNombre}.xlsx`.replace(/[^a-zA-Z0-9_.-]/g, '');
