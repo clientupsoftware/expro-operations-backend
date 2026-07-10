@@ -88,10 +88,20 @@ router.get('/on-call/:reportId/lines', async (req, res) => {
 // de la nueva linea (comportamiento pedido: "arrastrar" truck/set de presion entre corridas).
 router.get('/on-call/:reportId/lines/prefill', async (req, res) => {
   const lastLine = await pool.query(
-    'SELECT id, hasta FROM time_report_lines WHERE time_report_id = $1 ORDER BY id DESC LIMIT 1',
+    'SELECT id, fecha, desde, hasta FROM time_report_lines WHERE time_report_id = $1 ORDER BY id DESC LIMIT 1',
     [req.params.reportId]
   );
-  if (lastLine.rows.length === 0) return res.json({ assets: [], ultima_hasta: null });
+  if (lastLine.rows.length === 0) return res.json({ assets: [], ultima_hasta: null, fecha_sugerida: null });
+
+  const last = lastLine.rows[0];
+
+  // Si "hasta" es menor que "desde", la linea cruzo la medianoche -> la fecha sugerida es al dia siguiente
+  let fechaSugerida = last.fecha;
+  if (last.desde && last.hasta && last.hasta < last.desde) {
+    const next = new Date(last.fecha);
+    next.setDate(next.getDate() + 1);
+    fechaSugerida = next;
+  }
 
   const assetsResult = await pool.query(`
     SELECT time_report_line_assets.asset_id, time_report_line_assets.string_label,
@@ -99,9 +109,9 @@ router.get('/on-call/:reportId/lines/prefill', async (req, res) => {
     FROM time_report_line_assets
     JOIN assets ON assets.id = time_report_line_assets.asset_id
     WHERE time_report_line_id = $1
-  `, [lastLine.rows[0].id]);
+  `, [last.id]);
 
-  res.json({ assets: assetsResult.rows, ultima_hasta: lastLine.rows[0].hasta });
+  res.json({ assets: assetsResult.rows, ultima_hasta: last.hasta, fecha_sugerida: fechaSugerida });
 });
 
 // POST /api/time-reports/on-call/:reportId/lines
@@ -513,7 +523,7 @@ router.get('/on-call/:reportId/export', async (req, res) => {
     row.getCell(3).value = line.desde;  // C
     row.getCell(4).value = line.hasta;  // D
     row.getCell(5).value = toHoursDecimal(line.desde, line.hasta); // E
-    row.getCell(8).value = line.comentarios || [line.actividad, line.operacion].filter(Boolean).join(' - '); // H
+    row.getCell(8).value = line.comentarios || [line.operacion, line.actividad].filter(Boolean).join(' - '); // H
     if (line.profundidad_desde !== null || line.profundidad_hasta !== null) {
       const desdeTxt = line.profundidad_desde !== null ? `DESDE ${line.profundidad_desde} m` : '';
       const hastaTxt = line.profundidad_hasta !== null ? `HASTA ${line.profundidad_hasta} m` : '';
