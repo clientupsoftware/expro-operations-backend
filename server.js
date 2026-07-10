@@ -20,7 +20,7 @@ app.use(express.json());
 
 // Health check simple, util para verificar que Railway levanto el servicio
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Expro Operations System API' });
+  res.json({ status: 'ok', service: 'WellOps API' });
 });
 
 app.use('/api/auth', authRoutes);
@@ -42,5 +42,5 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log(`Expro Operations System API corriendo en el puerto ${PORT}`);
+  console.log(`WellOps API corriendo en el puerto ${PORT}`);
 });
