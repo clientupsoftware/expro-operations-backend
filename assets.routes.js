@@ -18,7 +18,7 @@ async function getSemaphoreThreshold() {
 
 // GET /api/assets - todos ven todo. Devuelve cada asset con su color de semaforo calculado.
 router.get('/', async (req, res) => {
-  const { category, location, search } = req.query;
+  const { category, location, search, estado } = req.query;
   const threshold = await getSemaphoreThreshold();
 
   let query = `
@@ -29,18 +29,24 @@ router.get('/', async (req, res) => {
   `;
   const values = [];
   if (category) { values.push(category); query += ` AND equipment_catalog.category = $${values.length}`; }
-  if (location) { values.push(location); query += ` AND assets.current_location = $${values.length}`; }
+  if (location) { values.push(`%${location}%`); query += ` AND assets.current_location ILIKE $${values.length}`; }
   if (search) {
     values.push(`%${search}%`);
     query += ` AND (assets.sap_equipment_code ILIKE $${values.length} OR assets.description ILIKE $${values.length})`;
   }
-  query += ' ORDER BY assets.sap_equipment_code LIMIT 100';
+  query += ' ORDER BY assets.sap_equipment_code LIMIT 300';
 
   const result = await pool.query(query, values);
-  const withSemaphore = result.rows.map((asset) => ({
+  let withSemaphore = result.rows.map((asset) => ({
     ...asset,
     semaphore: computeSemaphore(asset, threshold)
   }));
+
+  if (estado) {
+    withSemaphore = withSemaphore.filter((a) => a.semaphore === estado);
+  }
+  withSemaphore = withSemaphore.slice(0, 100);
+
   res.json(withSemaphore);
 });
 
