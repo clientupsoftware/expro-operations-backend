@@ -108,6 +108,37 @@ router.patch('/:id/job-number', requireRole('coordinador'), async (req, res) => 
   res.json(result.rows[0]);
 });
 
+// PATCH /api/jobs/:id/header - datos de encabezado del Job (Coordinador/Ingeniero/Super).
+// Estos valores son los que despues se usan como default en el Reporte de Tiempos,
+// para no tener que cargarlos dos veces.
+const JOB_HEADER_FIELDS = [
+  'rig_name', 'well_status', 'shut_in_tubing_pressure', 'flowing_thp', 'job_objective',
+  'representante_cliente', 'expro_representante',
+  'supervisor_dia', 'guinchero_dia', 'asistente_dia',
+  'supervisor_noche', 'guinchero_noche', 'asistente_noche',
+  'unidad_liviana', 'unidad_carga', 'unidad_wl',
+  'numero_wls', 'power_pack', 'wire_type_size', 'consumables_used'
+];
+router.patch('/:id/header', requireRole('coordinador', 'ingeniero'), async (req, res) => {
+  const setClauses = [];
+  const values = [];
+  JOB_HEADER_FIELDS.forEach((field) => {
+    if (field in req.body) {
+      values.push(req.body[field] || null);
+      setClauses.push(`${field} = $${values.length}`);
+    }
+  });
+  if (setClauses.length === 0) return res.status(400).json({ error: 'Nada para actualizar.' });
+
+  values.push(req.params.id);
+  const result = await pool.query(
+    `UPDATE jobs SET ${setClauses.join(', ')}, updated_at = now() WHERE id = $${values.length} RETURNING *`,
+    values
+  );
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Job no encontrado.' });
+  res.json(result.rows[0]);
+});
+
 // ---------- REQUIRED TOOLS (pedido de herramientas del Ingeniero) ----------
 
 // GET /api/jobs/:id/required-tools
