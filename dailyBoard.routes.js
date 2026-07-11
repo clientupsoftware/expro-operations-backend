@@ -49,7 +49,14 @@ router.patch('/:id', requireRole('coordinador'), async (req, res) => {
     values
   );
   if (result.rows.length === 0) return res.status(404).json({ error: 'Entrada no encontrada.' });
-  res.json(result.rows[0]);
+
+  const entry = result.rows[0];
+  // Si esta entrada ya fue enviada a un Job y el estado cambio, se refleja el mismo estado en el Job
+  if ('estado' in req.body && entry.job_id) {
+    await pool.query('UPDATE jobs SET status = $1, updated_at = now() WHERE id = $2', [entry.estado, entry.job_id]);
+  }
+
+  res.json(entry);
 });
 
 // DELETE /api/daily-board/:id (Coordinador/Super)
@@ -123,8 +130,8 @@ router.post('/:id/promote', requireRole('coordinador'), async (req, res) => {
     }
 
     const jobResult = await client.query(
-      `INSERT INTO jobs (pad_id, created_by) VALUES ($1, $2) RETURNING *`,
-      [pad.id, req.user.id]
+      `INSERT INTO jobs (pad_id, created_by, status) VALUES ($1, $2, $3) RETURNING *`,
+      [pad.id, req.user.id, entry.estado]
     );
     const job = jobResult.rows[0];
 
@@ -133,11 +140,11 @@ router.post('/:id/promote', requireRole('coordinador'), async (req, res) => {
       await client.query('INSERT INTO job_services (job_id, service_id) VALUES ($1, $2)', [job.id, serviceId]);
     }
 
+    // El Job queda vinculado a esta entrada. El estado NO cambia solo por enviarlo a PreJob:
+    // el Job nace con el mismo estado que tenia la entrada en ese momento, y de ahi en adelante
+    // se mantienen sincronizados (ver PATCH /:id mas arriba).
     await client.query(
-      `UPDATE daily_board_entries SET job_id = $1,
-         estado = CASE WHEN estado = 'proxima_operacion' THEN 'en_operacion' ELSE estado END,
-         updated_at = now()
-       WHERE id = $2`,
+      `UPDATE daily_board_entries SET job_id = $1, updated_at = now() WHERE id = $2`,
       [job.id, id]
     );
 
