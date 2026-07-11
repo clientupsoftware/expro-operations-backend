@@ -22,6 +22,19 @@ router.post('/clients', requireRole('coordinador'), async (req, res) => {
   res.status(201).json(result.rows[0]);
 });
 
+router.delete('/clients/:id', requireRole('coordinador'), async (req, res) => {
+  try {
+    await pool.query('DELETE FROM clients WHERE id = $1', [req.params.id]);
+    res.status(204).send();
+  } catch (err) {
+    if (err.code === '23503') {
+      return res.status(400).json({ error: 'No se puede eliminar: hay PADs o Jobs que usan este cliente.' });
+    }
+    console.error(err);
+    res.status(500).json({ error: 'Error al eliminar el cliente.' });
+  }
+});
+
 // ---------- PADS ----------
 router.get('/pads', async (req, res) => {
   const result = await pool.query(`
@@ -76,6 +89,19 @@ router.post('/services', requireRole('coordinador'), async (req, res) => {
     [name]
   );
   res.status(201).json(result.rows[0]);
+});
+
+router.delete('/services/:id', requireRole('coordinador'), async (req, res) => {
+  try {
+    await pool.query('DELETE FROM services WHERE id = $1', [req.params.id]);
+    res.status(204).send();
+  } catch (err) {
+    if (err.code === '23503') {
+      return res.status(400).json({ error: 'No se puede eliminar: hay Jobs que usan este servicio.' });
+    }
+    console.error(err);
+    res.status(500).json({ error: 'Error al eliminar el servicio.' });
+  }
 });
 
 module.exports = router;
