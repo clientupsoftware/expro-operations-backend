@@ -9,9 +9,24 @@ router.use(requireAuth);
 // GET /api/daily-board - todos los roles ven el tablero completo
 router.get('/', async (req, res) => {
   const result = await pool.query(`
-    SELECT daily_board_entries.*, clients.name AS client_name
+    SELECT daily_board_entries.*, clients.name AS client_name,
+           COALESCE(sup_dia.name, daily_board_entries.supervisor_dia_text) AS supervisor_dia_name,
+           COALESCE(sup_noche.name, daily_board_entries.supervisor_noche_text) AS supervisor_noche_name,
+           COALESCE(gui_dia.name, daily_board_entries.guinchero_dia_text) AS guinchero_dia_name,
+           COALESCE(gui_noche.name, daily_board_entries.guinchero_noche_text) AS guinchero_noche_name,
+           COALESCE(
+             json_agg(DISTINCT jsonb_build_object('id', crew_p.id, 'name', crew_p.name))
+               FILTER (WHERE crew_p.id IS NOT NULL), '[]'
+           ) AS crew
     FROM daily_board_entries
     LEFT JOIN clients ON clients.id = daily_board_entries.client_id
+    LEFT JOIN personnel sup_dia ON sup_dia.id = daily_board_entries.supervisor_dia_id
+    LEFT JOIN personnel sup_noche ON sup_noche.id = daily_board_entries.supervisor_noche_id
+    LEFT JOIN personnel gui_dia ON gui_dia.id = daily_board_entries.guinchero_dia_id
+    LEFT JOIN personnel gui_noche ON gui_noche.id = daily_board_entries.guinchero_noche_id
+    LEFT JOIN daily_board_crew ON daily_board_crew.entry_id = daily_board_entries.id
+    LEFT JOIN personnel crew_p ON crew_p.id = daily_board_crew.personnel_id
+    GROUP BY daily_board_entries.id, clients.name, sup_dia.name, sup_noche.name, gui_dia.name, gui_noche.name
     ORDER BY daily_board_entries.fecha DESC NULLS LAST, daily_board_entries.id DESC
   `);
   res.json(result.rows);
@@ -19,19 +34,54 @@ router.get('/', async (req, res) => {
 
 // POST /api/daily-board - crear entrada (Coordinador/Super)
 router.post('/', requireRole('coordinador'), async (req, res) => {
-  const { estado, fecha, unidad, pozo, tipo_unidad, client_id, edp, servicios, supervisor, comentarios } = req.body;
-  const result = await pool.query(
-    `INSERT INTO daily_board_entries
-       (estado, fecha, unidad, pozo, tipo_unidad, client_id, edp, servicios, supervisor, comentarios, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-    [estado || 'proxima_operacion', fecha || null, unidad || null, pozo || null, tipo_unidad || null,
-     client_id || null, edp || null, servicios || null, supervisor || null, comentarios || null, req.user.id]
-  );
-  res.status(201).json(result.rows[0]);
+  const {
+    estado, fecha, unidad, pozo, tipo_unidad, client_id, edp, servicios, comentarios,
+    supervisor_dia_id, supervisor_noche_id, guinchero_dia_id, guinchero_noche_id,
+    supervisor_dia_text, supervisor_noche_text, guinchero_dia_text, guinchero_noche_text, crew_ids
+  } = req.body;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `INSERT INTO daily_board_entries
+         (estado, fecha, unidad, pozo, tipo_unidad, client_id, edp, servicios, comentarios, created_by,
+          supervisor_dia_id, supervisor_noche_id, guinchero_dia_id, guinchero_noche_id,
+          supervisor_dia_text, supervisor_noche_text, guinchero_dia_text, guinchero_noche_text)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
+      [estado || 'proxima_operacion', fecha || null, unidad || null, pozo || null, tipo_unidad || null,
+       client_id || null, edp || null, servicios || null, comentarios || null, req.user.id,
+       supervisor_dia_id || null, supervisor_noche_id || null, guinchero_dia_id || null, guinchero_noche_id || null,
+       supervisor_dia_text || null, supervisor_noche_text || null, guinchero_dia_text || null, guinchero_noche_text || null]
+    );
+    const entry = result.rows[0];
+
+    if (Array.isArray(crew_ids)) {
+      for (const personnelId of crew_ids) {
+        await client.query(
+          'INSERT INTO daily_board_crew (entry_id, personnel_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [entry.id, personnelId]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json(entry);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al crear la entrada.' });
+  } finally {
+    client.release();
+  }
 });
 
 // PATCH /api/daily-board/:id - editar cualquier campo (Coordinador/Super)
-const EDITABLE_FIELDS = ['estado', 'fecha', 'unidad', 'pozo', 'tipo_unidad', 'client_id', 'edp', 'servicios', 'supervisor', 'comentarios'];
+const EDITABLE_FIELDS = [
+  'estado', 'fecha', 'unidad', 'pozo', 'tipo_unidad', 'client_id', 'edp', 'servicios', 'comentarios',
+  'supervisor_dia_id', 'supervisor_noche_id', 'guinchero_dia_id', 'guinchero_noche_id',
+  'supervisor_dia_text', 'supervisor_noche_text', 'guinchero_dia_text', 'guinchero_noche_text'
+];
 router.patch('/:id', requireRole('coordinador'), async (req, res) => {
   const setClauses = [];
   const values = [];
@@ -41,22 +91,61 @@ router.patch('/:id', requireRole('coordinador'), async (req, res) => {
       setClauses.push(`${field} = $${values.length}`);
     }
   });
-  if (setClauses.length === 0) return res.status(400).json({ error: 'Nada para actualizar.' });
-
-  values.push(req.params.id);
-  const result = await pool.query(
-    `UPDATE daily_board_entries SET ${setClauses.join(', ')}, updated_at = now() WHERE id = $${values.length} RETURNING *`,
-    values
-  );
-  if (result.rows.length === 0) return res.status(404).json({ error: 'Entrada no encontrada.' });
-
-  const entry = result.rows[0];
-  // Si esta entrada ya fue enviada a un Job y el estado cambio, se refleja el mismo estado en el Job
-  if ('estado' in req.body && entry.job_id) {
-    await pool.query('UPDATE jobs SET status = $1, updated_at = now() WHERE id = $2', [entry.estado, entry.job_id]);
+  if (setClauses.length === 0 && !Array.isArray(req.body.crew_ids)) {
+    return res.status(400).json({ error: 'Nada para actualizar.' });
   }
 
-  res.json(entry);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    let entry;
+    if (setClauses.length > 0) {
+      values.push(req.params.id);
+      const result = await client.query(
+        `UPDATE daily_board_entries SET ${setClauses.join(', ')}, updated_at = now() WHERE id = $${values.length} RETURNING *`,
+        values
+      );
+      if (result.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Entrada no encontrada.' });
+      }
+      entry = result.rows[0];
+    }
+
+    if (Array.isArray(req.body.crew_ids)) {
+      await client.query('DELETE FROM daily_board_crew WHERE entry_id = $1', [req.params.id]);
+      for (const personnelId of req.body.crew_ids) {
+        await client.query(
+          'INSERT INTO daily_board_crew (entry_id, personnel_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [req.params.id, personnelId]
+        );
+      }
+    }
+
+    if (!entry) {
+      const current = await client.query('SELECT * FROM daily_board_entries WHERE id = $1', [req.params.id]);
+      if (current.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Entrada no encontrada.' });
+      }
+      entry = current.rows[0];
+    }
+
+    // Si esta entrada ya fue enviada a un Job y el estado cambio, se refleja el mismo estado en el Job
+    if ('estado' in req.body && entry.job_id) {
+      await client.query('UPDATE jobs SET status = $1, updated_at = now() WHERE id = $2', [entry.estado, entry.job_id]);
+    }
+
+    await client.query('COMMIT');
+    res.json(entry);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al actualizar la entrada.' });
+  } finally {
+    client.release();
+  }
 });
 
 // DELETE /api/daily-board/:id (Coordinador/Super)
@@ -163,9 +252,13 @@ router.post('/:id/promote', requireRole('coordinador'), async (req, res) => {
 router.get('/export', async (req, res) => {
   const ExcelJS = require('exceljs');
   const result = await pool.query(`
-    SELECT daily_board_entries.*, clients.name AS client_name
+    SELECT daily_board_entries.*, clients.name AS client_name,
+           COALESCE(sup_dia.name, daily_board_entries.supervisor_dia_text) AS supervisor_dia_name,
+           COALESCE(sup_noche.name, daily_board_entries.supervisor_noche_text) AS supervisor_noche_name
     FROM daily_board_entries
     LEFT JOIN clients ON clients.id = daily_board_entries.client_id
+    LEFT JOIN personnel sup_dia ON sup_dia.id = daily_board_entries.supervisor_dia_id
+    LEFT JOIN personnel sup_noche ON sup_noche.id = daily_board_entries.supervisor_noche_id
     ORDER BY daily_board_entries.fecha DESC NULLS LAST, daily_board_entries.id DESC
   `);
 
@@ -187,6 +280,8 @@ router.get('/export', async (req, res) => {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('Parte Diario');
 
+  // Mismas columnas de siempre - la info nueva (Guinchero, Cuadrilla) vive en el software
+  // pero no se agrega al Excel para no cambiar el formato con el que ya se venia trabajando.
   const headers = ['Estado', 'Fecha', 'Unidad', 'Pozo', 'Un.', 'Cliente', 'EDP', 'Servicios', 'Supervisor', 'Comments'];
   const headerRow = sheet.addRow(headers);
   headerRow.eachCell((cell) => {
@@ -195,6 +290,7 @@ router.get('/export', async (req, res) => {
   });
 
   for (const entry of result.rows) {
+    const supervisorCombined = [entry.supervisor_dia_name, entry.supervisor_noche_name].filter(Boolean).join(' / ');
     const row = sheet.addRow([
       ESTADO_LABELS[entry.estado] || entry.estado,
       entry.fecha,
@@ -204,7 +300,7 @@ router.get('/export', async (req, res) => {
       entry.client_name,
       entry.edp,
       entry.servicios,
-      entry.supervisor,
+      supervisorCombined,
       entry.comentarios
     ]);
     row.getCell(2).numFmt = 'dd-mmm';
