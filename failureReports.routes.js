@@ -166,6 +166,13 @@ router.patch('/:id', requireAuth, async (req, res) => {
 });
 
 // GET /api/failure-reports/:id/export
+// DELETE /api/failure-reports/:id - por si se cargo por error; borra en cascada sus assets y fotos
+router.delete('/:id', requireAuth, async (req, res) => {
+  const result = await pool.query('DELETE FROM failure_reports WHERE id = $1 RETURNING id', [req.params.id]);
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Reporte no encontrado.' });
+  res.status(204).send();
+});
+
 router.get('/:id/export', requireAuth, async (req, res) => {
   try {
     const report = await pool.query('SELECT * FROM failure_reports WHERE id = $1', [req.params.id]);
