@@ -1,9 +1,11 @@
 const express = require('express');
+const multer = require('multer');
 const pool = require('./db');
 const { requireAuth } = require('./authMiddleware');
 const { requireRole } = require('./permissionsMiddleware');
 
 const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 router.use(requireAuth);
 
 // Reemplaza todas las asignaciones (supervisor/guinchero/ayudante, dia/noche) de una entrada
@@ -204,6 +206,126 @@ router.post('/:id/promote', requireRole('coordinador'), async (req, res) => {
     await client.query('ROLLBACK');
     console.error(err);
     res.status(500).json({ error: 'Error al enviar la entrada a PreJob.' });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/daily-board/import - carga masiva desde un Excel con el mismo formato de "Exportar a Excel"
+// (Estado, Fecha, Unidad, Pozo, Un., Cliente, EDP, Servicios, Supervisor, Comments).
+// El Supervisor se carga como texto libre (text_fallback), igual que cuando hoy se escribe
+// "nombre no listado" en el picker - queda 100% editable despues desde la UI normal.
+router.post('/import', requireRole('coordinador'), upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Falta el archivo (campo "file").' });
+
+  const ExcelJS = require('exceljs');
+  const workbook = new ExcelJS.Workbook();
+  try {
+    await workbook.xlsx.load(req.file.buffer);
+  } catch (err) {
+    return res.status(400).json({ error: 'No se pudo leer el archivo. Verifica que sea un .xlsx valido.' });
+  }
+
+  const ESTADO_LABEL_TO_VALUE = {
+    'prox. op': 'proxima_operacion',
+    'en op.': 'en_operacion',
+    'op. finalizada': 'operacion_finalizada',
+    'op. cancelada': 'operacion_cancelada',
+    'op. rechazada': 'operacion_rechazada'
+  };
+
+  function parseEstado(value) {
+    if (!value) return 'proxima_operacion';
+    const normalized = String(value).trim().toLowerCase();
+    return ESTADO_LABEL_TO_VALUE[normalized] || 'proxima_operacion';
+  }
+
+  function parseFecha(value) {
+    if (!value) return null;
+    if (value instanceof Date) return value.toISOString().slice(0, 10);
+    const parsed = new Date(value);
+    return isNaN(parsed.getTime()) ? null : parsed.toISOString().slice(0, 10);
+  }
+
+  function cellText(value) {
+    if (value === null || value === undefined) return null;
+    const str = String(value).trim();
+    return str === '' ? null : str;
+  }
+
+  const sheet = workbook.worksheets[0];
+  const rows = [];
+  sheet.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return; // encabezado
+    const v = row.values; // v[0] vacio en exceljs, columnas arrancan en v[1]
+    const pozo = cellText(v[4]);
+    const fecha = parseFecha(v[2]);
+    if (!pozo && !fecha) return; // fila vacia
+    rows.push({
+      estado: parseEstado(v[1]),
+      fecha,
+      unidad: cellText(v[3]),
+      pozo,
+      tipo_unidad: cellText(v[5]),
+      cliente_nombre: cellText(v[6]),
+      edp: cellText(v[7]),
+      servicios: cellText(v[8]),
+      supervisor: cellText(v[9]),
+      comentarios: cellText(v[10])
+    });
+  });
+
+  if (rows.length === 0) return res.status(400).json({ error: 'El archivo no tiene filas para importar.' });
+
+  const client = await pool.connect();
+  let created = 0;
+  const clientIdCache = {};
+  try {
+    await client.query('BEGIN');
+
+    for (const row of rows) {
+      let clientId = null;
+      if (row.cliente_nombre) {
+        const key = row.cliente_nombre.toLowerCase();
+        if (clientIdCache[key]) {
+          clientId = clientIdCache[key];
+        } else {
+          const existing = await client.query('SELECT id FROM clients WHERE LOWER(name) = LOWER($1)', [row.cliente_nombre]);
+          if (existing.rows.length > 0) {
+            clientId = existing.rows[0].id;
+          } else {
+            const inserted = await client.query('INSERT INTO clients (name) VALUES ($1) RETURNING id', [row.cliente_nombre]);
+            clientId = inserted.rows[0].id;
+          }
+          clientIdCache[key] = clientId;
+        }
+      }
+
+      const entryResult = await client.query(
+        `INSERT INTO daily_board_entries
+           (estado, fecha, unidad, pozo, tipo_unidad, client_id, edp, servicios, comentarios, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+        [row.estado, row.fecha, row.unidad, row.pozo, row.tipo_unidad, clientId, row.edp, row.servicios, row.comentarios, req.user.id]
+      );
+      const entryId = entryResult.rows[0].id;
+
+      if (row.supervisor) {
+        await client.query(
+          `INSERT INTO daily_board_assignments (entry_id, role, turno, personnel_id, text_fallback)
+           VALUES ($1, 'supervisor', 'dia', NULL, $2)`,
+          [entryId, row.supervisor]
+        );
+      }
+
+      created += 1;
+    }
+
+    await client.query('COMMIT');
+    res.json({ message: 'Importacion completa.', created, total_procesados: rows.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error durante la importacion. No se guardo ningun cambio.' });
   } finally {
     client.release();
   }
