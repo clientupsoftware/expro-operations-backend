@@ -19,6 +19,7 @@ const timeReportsRoutes = require('./timeReports.routes');
 const maintenanceRoutes = require('./maintenance.routes');
 const settingsRoutes = require('./settings.routes');
 const failureReportsRoutes = require('./failureReports.routes');
+const statsRoutes = require('./stats.routes');
 
 const app = express();
 
@@ -47,6 +48,7 @@ app.use('/api/time-reports', timeReportsRoutes);
 app.use('/api/maintenance', maintenanceRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/failure-reports', failureReportsRoutes);
+app.use('/api/stats', statsRoutes);
 
 // Manejo generico de errores no capturados
 app.use((err, req, res, next) => {
