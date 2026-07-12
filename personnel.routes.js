@@ -124,17 +124,12 @@ router.delete('/bulk', requireRole('coordinador'), ah(async (req, res) => {
 // persona, sin perder nada operativamente relevante.
 // - personnel_status_overrides: excepciones (franco compensatorio, licencia, etc.).
 // - daily_board_crew: tabla legacy, reemplazada por daily_board_assignments.
-// - supervisor_dia_id / supervisor_noche_id / guinchero_dia_id / guinchero_noche_id en
-//   daily_board_entries: columnas legacy de antes de unificar todo en daily_board_assignments.
-//   El frontend actual (DailyBoard.jsx) ya no las lee ni las escribe - la fuente de verdad
-//   de quien esta asignado a una entrada es siempre daily_board_assignments.
+// (las columnas legacy supervisor_dia_id/supervisor_noche_id/guinchero_dia_id/guinchero_noche_id
+//  de daily_board_entries ya se eliminaron de la tabla con ALTER TABLE DROP COLUMN, no hace falta
+//  limpiarlas mas aca)
 async function limpiarHistorialDescartable(client, personnelId) {
   await client.query('DELETE FROM personnel_status_overrides WHERE personnel_id = $1', [personnelId]);
   await client.query('DELETE FROM daily_board_crew WHERE personnel_id = $1', [personnelId]);
-  await client.query('UPDATE daily_board_entries SET supervisor_dia_id = NULL WHERE supervisor_dia_id = $1', [personnelId]);
-  await client.query('UPDATE daily_board_entries SET supervisor_noche_id = NULL WHERE supervisor_noche_id = $1', [personnelId]);
-  await client.query('UPDATE daily_board_entries SET guinchero_dia_id = NULL WHERE guinchero_dia_id = $1', [personnelId]);
-  await client.query('UPDATE daily_board_entries SET guinchero_noche_id = NULL WHERE guinchero_noche_id = $1', [personnelId]);
 }
 
 // Tablas que SI son datos operativos reales y no se tocan: si el borrado sigue fallando
