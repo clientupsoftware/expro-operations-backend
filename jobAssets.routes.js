@@ -10,7 +10,7 @@ router.use(requireAuth);
 router.get('/:jobId', async (req, res) => {
   const result = await pool.query(`
     SELECT job_assets.*, assets.sap_equipment_code, assets.description, assets.serial_number,
-           assets.cumulative_runs, kit_templates.name AS kit_name
+           assets.cumulative_runs, assets.cumulative_operations, kit_templates.name AS kit_name
     FROM job_assets
     JOIN assets ON assets.id = job_assets.asset_id
     LEFT JOIN kit_templates ON kit_templates.id = job_assets.kit_template_id
