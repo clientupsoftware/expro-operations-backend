@@ -6,6 +6,18 @@ const { requireAuth } = require('./authMiddleware');
 const { exportFailureReportToWord } = require('./failureReportExport');
 
 // GET /api/failure-reports/:id  -> detalle completo con assets y fotos
+// GET /api/failure-reports/by-line/:lineId - lista liviana de los reportes ya cargados
+// para una linea del Reporte de Tiempos (puede haber mas de uno - varios eventos en la misma linea).
+router.get('/by-line/:lineId', requireAuth, async (req, res) => {
+  const result = await pool.query(
+    `SELECT id, event_datetime, npt, clasificacion_nivel, estado
+     FROM failure_reports WHERE time_report_line_id = $1
+     ORDER BY created_at DESC`,
+    [req.params.lineId]
+  );
+  res.json(result.rows);
+});
+
 router.get('/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
   const report = await pool.query('SELECT * FROM failure_reports WHERE id = $1', [id]);
@@ -103,13 +115,54 @@ router.patch('/:id', requireAuth, async (req, res) => {
       values.push(fields[key]);
     }
   }
-  if (!setClauses.length) return res.status(400).json({ error: 'Sin campos para actualizar' });
-  values.push(id);
-  await pool.query(
-    `UPDATE failure_reports SET ${setClauses.join(', ')}, updated_at = now() WHERE id = $${i}`,
-    values
-  );
-  res.json({ ok: true });
+  const hasAssetIds = Array.isArray(fields.asset_ids);
+  if (!setClauses.length && !hasAssetIds) {
+    return res.status(400).json({ error: 'Sin campos para actualizar' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (setClauses.length) {
+      values.push(id);
+      await client.query(
+        `UPDATE failure_reports SET ${setClauses.join(', ')}, updated_at = now() WHERE id = $${values.length}`,
+        values
+      );
+    }
+
+    if (hasAssetIds) {
+      const reportResult = await client.query('SELECT time_report_line_id FROM failure_reports WHERE id = $1', [id]);
+      if (reportResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Reporte no encontrado.' });
+      }
+      const lineId = reportResult.rows[0].time_report_line_id;
+
+      await client.query('DELETE FROM failure_report_assets WHERE failure_report_id = $1', [id]);
+
+      const validAssets = await client.query(
+        `SELECT asset_id FROM time_report_line_assets WHERE time_report_line_id = $1 AND asset_id = ANY($2::int[])`,
+        [lineId, fields.asset_ids]
+      );
+      for (const row of validAssets.rows) {
+        await client.query(
+          'INSERT INTO failure_report_assets (failure_report_id, asset_id) VALUES ($1, $2)',
+          [id, row.asset_id]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al actualizar el reporte de falla.' });
+  } finally {
+    client.release();
+  }
 });
 
 // GET /api/failure-reports/:id/export
