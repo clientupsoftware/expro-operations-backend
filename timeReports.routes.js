@@ -61,6 +61,20 @@ router.post('/:jobId', requireRole('coordinador', 'ingeniero'), async (req, res)
   res.status(201).json(result.rows[0]);
 });
 
+// DELETE /api/time-reports/:id - solo si el reporte todavia esta vacio (sin lineas ni stages cargadas).
+// Es lo que permite al ingeniero "volver atras" y elegir el otro formato antes de empezar a cargar datos.
+router.delete('/:id', requireRole('coordinador', 'ingeniero'), async (req, res) => {
+  const { id } = req.params;
+  const linesCount = await pool.query('SELECT COUNT(*) FROM time_report_lines WHERE time_report_id = $1', [id]);
+  const stagesCount = await pool.query('SELECT COUNT(*) FROM bundle_stages WHERE time_report_id = $1', [id]);
+  if (parseInt(linesCount.rows[0].count, 10) > 0 || parseInt(stagesCount.rows[0].count, 10) > 0) {
+    return res.status(400).json({ error: 'Este reporte ya tiene lineas cargadas, no se puede eliminar ni cambiar de formato.' });
+  }
+  const result = await pool.query('DELETE FROM time_reports WHERE id = $1 RETURNING id', [id]);
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Reporte no encontrado.' });
+  res.status(204).send();
+});
+
 // ================= ON CALL =================
 
 // GET /api/time-reports/on-call/:reportId/lines

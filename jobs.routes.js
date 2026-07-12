@@ -231,4 +231,43 @@ router.delete('/:id/required-tools/:toolId', requireRole('coordinador', 'ingenie
   res.status(204).send();
 });
 
+// DELETE /api/jobs/:id - eliminar un Job completo (solo Super). El frontend exige confirmar
+// la contrasena antes de llamar a este endpoint (ver POST /api/auth/verify-password).
+router.delete('/:id', requireRole('super'), async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Desvincula (sin borrar) registros que deben sobrevivir a la eliminacion del Job:
+    // el historial de carreras de los assets (importante para mantenimiento preventivo)
+    // y la entrada de Parte Diario de origen, si la tenia.
+    await client.query('UPDATE asset_runs SET job_id = NULL WHERE job_id = $1', [id]);
+    await client.query('UPDATE daily_board_entries SET job_id = NULL WHERE job_id = $1', [id]);
+
+    // Estas dos tablas se agregaron en migraciones posteriores al schema original y por las
+    // dudas no tengan ON DELETE CASCADE configurado: se limpian explicitamente antes de borrar el Job.
+    await client.query('DELETE FROM job_services WHERE job_id = $1', [id]);
+    await client.query('DELETE FROM job_peripherals WHERE job_id = $1', [id]);
+
+    // El resto (job_wells, required_tools, job_assets, shipping_lists+items, time_reports y todo
+    // lo que cuelga de ahi: lineas, assets de linea, bundle stages, assets de stage) ya tiene
+    // ON DELETE CASCADE en el schema, asi que se borra solo al borrar el Job.
+    const result = await client.query('DELETE FROM jobs WHERE id = $1 RETURNING id', [id]);
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Job no encontrado.' });
+    }
+
+    await client.query('COMMIT');
+    res.status(204).send();
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al eliminar el Job. No se borro nada.' });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;

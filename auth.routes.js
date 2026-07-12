@@ -42,4 +42,21 @@ router.get('/me', requireAuth, (req, res) => {
   res.json({ user: req.user });
 });
 
+// POST /api/auth/verify-password - confirma la contrasena del usuario logueado (para acciones criticas, ej: borrar un Job)
+router.post('/verify-password', requireAuth, async (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: 'La contrasena es requerida.' });
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
+    const user = result.rows[0];
+    if (!user) return res.status(401).json({ error: 'Usuario no encontrado.' });
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) return res.status(401).json({ error: 'Contrasena incorrecta.' });
+    res.json({ valid: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al verificar la contrasena.' });
+  }
+});
+
 module.exports = router;
