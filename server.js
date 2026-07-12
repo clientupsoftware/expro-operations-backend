@@ -19,6 +19,9 @@ const timeReportsRoutes = require('./timeReports.routes');
 const maintenanceRoutes = require('./maintenance.routes');
 const settingsRoutes = require('./settings.routes');
 
+const failureReportsRoutes = require('./failureReports.routes');
+app.use('/api/failure-reports', failureReportsRoutes);
+
 const app = express();
 
 app.use(cors());
