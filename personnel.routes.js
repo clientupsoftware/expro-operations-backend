@@ -120,28 +120,31 @@ router.delete('/bulk', requireRole('coordinador'), ah(async (req, res) => {
   res.json({ deleted, failed });
 }));
 
-// Tablas que son historial descartable: se pueden limpiar automaticamente al borrar una persona,
-// sin perder nada operativamente relevante.
-// - personnel_status_overrides: excepciones (franco compensatorio, licencia, etc.) ya vencidas o no.
-// - daily_board_crew: tabla legacy, reemplazada por daily_board_assignments. Puede tener filas viejas
-//   de antes de la unificacion que ya no se usan en ningun lado del codigo actual.
+// Tablas/columnas que son historial descartable: se pueden limpiar automaticamente al borrar una
+// persona, sin perder nada operativamente relevante.
+// - personnel_status_overrides: excepciones (franco compensatorio, licencia, etc.).
+// - daily_board_crew: tabla legacy, reemplazada por daily_board_assignments.
+// - supervisor_dia_id / supervisor_noche_id / guinchero_dia_id / guinchero_noche_id en
+//   daily_board_entries: columnas legacy de antes de unificar todo en daily_board_assignments.
+//   El frontend actual (DailyBoard.jsx) ya no las lee ni las escribe - la fuente de verdad
+//   de quien esta asignado a una entrada es siempre daily_board_assignments.
 async function limpiarHistorialDescartable(client, personnelId) {
   await client.query('DELETE FROM personnel_status_overrides WHERE personnel_id = $1', [personnelId]);
   await client.query('DELETE FROM daily_board_crew WHERE personnel_id = $1', [personnelId]);
+  await client.query('UPDATE daily_board_entries SET supervisor_dia_id = NULL WHERE supervisor_dia_id = $1', [personnelId]);
+  await client.query('UPDATE daily_board_entries SET supervisor_noche_id = NULL WHERE supervisor_noche_id = $1', [personnelId]);
+  await client.query('UPDATE daily_board_entries SET guinchero_dia_id = NULL WHERE guinchero_dia_id = $1', [personnelId]);
+  await client.query('UPDATE daily_board_entries SET guinchero_noche_id = NULL WHERE guinchero_noche_id = $1', [personnelId]);
 }
 
-// Tablas que SI son datos operativos reales (Parte Diario activo, reportes de falla) y no se tocan:
-// si el borrado sigue fallando despues de limpiar lo descartable, es porque la persona esta
-// realmente referenciada ahi, y eso hay que resolverlo a mano (reasignar o dejar la persona inactiva).
+// Tablas que SI son datos operativos reales y no se tocan: si el borrado sigue fallando
+// despues de limpiar lo descartable, es porque la persona esta realmente asignada en la
+// tabla vigente de asignaciones, o en un reporte de falla - eso hay que resolverlo a mano.
 async function encontrarBloqueoReal(client, personnelId) {
   const checks = [
-    { tabla: 'daily_board_entries', label: 'Supervisor (dia) en Parte Diario', sql: 'SELECT 1 FROM daily_board_entries WHERE supervisor_dia_id = $1 LIMIT 1' },
-    { tabla: 'daily_board_entries', label: 'Supervisor (noche) en Parte Diario', sql: 'SELECT 1 FROM daily_board_entries WHERE supervisor_noche_id = $1 LIMIT 1' },
-    { tabla: 'daily_board_entries', label: 'Guinchero (dia) en Parte Diario', sql: 'SELECT 1 FROM daily_board_entries WHERE guinchero_dia_id = $1 LIMIT 1' },
-    { tabla: 'daily_board_entries', label: 'Guinchero (noche) en Parte Diario', sql: 'SELECT 1 FROM daily_board_entries WHERE guinchero_noche_id = $1 LIMIT 1' },
-    { tabla: 'daily_board_assignments', label: 'Asignado en Parte Diario (Ayudante/multi-persona)', sql: 'SELECT 1 FROM daily_board_assignments WHERE personnel_id = $1 LIMIT 1' },
-    { tabla: 'failure_reports', label: 'Supervisor en un Reporte de Falla', sql: 'SELECT 1 FROM failure_reports WHERE supervisor_id = $1 LIMIT 1' },
-    { tabla: 'failure_reports', label: 'Responsable de seguimiento en un Reporte de Falla', sql: 'SELECT 1 FROM failure_reports WHERE responsable_seguimiento_id = $1 LIMIT 1' }
+    { label: 'Asignado en Parte Diario (Supervisor/Guinchero/Ayudante)', sql: 'SELECT 1 FROM daily_board_assignments WHERE personnel_id = $1 LIMIT 1' },
+    { label: 'Supervisor en un Reporte de Falla', sql: 'SELECT 1 FROM failure_reports WHERE supervisor_id = $1 LIMIT 1' },
+    { label: 'Responsable de seguimiento en un Reporte de Falla', sql: 'SELECT 1 FROM failure_reports WHERE responsable_seguimiento_id = $1 LIMIT 1' }
   ];
   for (const check of checks) {
     const result = await client.query(check.sql, [personnelId]);
