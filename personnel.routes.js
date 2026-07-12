@@ -110,26 +110,79 @@ router.delete('/bulk', requireRole('coordinador'), ah(async (req, res) => {
   let deleted = 0;
   const failed = [];
   for (const id of personnel_ids) {
-    try {
-      await pool.query('DELETE FROM personnel WHERE id = $1', [id]);
+    const resultado = await borrarPersonaSegura(id);
+    if (resultado.ok) {
       deleted += 1;
-    } catch (err) {
-      failed.push(id);
+    } else {
+      failed.push({ id, motivo: resultado.motivo });
     }
   }
   res.json({ deleted, failed });
 }));
 
-router.delete('/:id', requireRole('coordinador'), ah(async (req, res) => {
-  try {
-    await pool.query('DELETE FROM personnel WHERE id = $1', [req.params.id]);
-    res.status(204).send();
-  } catch (err) {
-    if (err.code === '23503') {
-      return res.status(400).json({ error: 'No se puede eliminar: esta persona todavia tiene datos relacionados que lo impiden.' });
-    }
-    throw err;
+// Tablas que son historial descartable: se pueden limpiar automaticamente al borrar una persona,
+// sin perder nada operativamente relevante.
+// - personnel_status_overrides: excepciones (franco compensatorio, licencia, etc.) ya vencidas o no.
+// - daily_board_crew: tabla legacy, reemplazada por daily_board_assignments. Puede tener filas viejas
+//   de antes de la unificacion que ya no se usan en ningun lado del codigo actual.
+async function limpiarHistorialDescartable(client, personnelId) {
+  await client.query('DELETE FROM personnel_status_overrides WHERE personnel_id = $1', [personnelId]);
+  await client.query('DELETE FROM daily_board_crew WHERE personnel_id = $1', [personnelId]);
+}
+
+// Tablas que SI son datos operativos reales (Parte Diario activo, reportes de falla) y no se tocan:
+// si el borrado sigue fallando despues de limpiar lo descartable, es porque la persona esta
+// realmente referenciada ahi, y eso hay que resolverlo a mano (reasignar o dejar la persona inactiva).
+async function encontrarBloqueoReal(client, personnelId) {
+  const checks = [
+    { tabla: 'daily_board_entries', label: 'Supervisor (dia) en Parte Diario', sql: 'SELECT 1 FROM daily_board_entries WHERE supervisor_dia_id = $1 LIMIT 1' },
+    { tabla: 'daily_board_entries', label: 'Supervisor (noche) en Parte Diario', sql: 'SELECT 1 FROM daily_board_entries WHERE supervisor_noche_id = $1 LIMIT 1' },
+    { tabla: 'daily_board_entries', label: 'Guinchero (dia) en Parte Diario', sql: 'SELECT 1 FROM daily_board_entries WHERE guinchero_dia_id = $1 LIMIT 1' },
+    { tabla: 'daily_board_entries', label: 'Guinchero (noche) en Parte Diario', sql: 'SELECT 1 FROM daily_board_entries WHERE guinchero_noche_id = $1 LIMIT 1' },
+    { tabla: 'daily_board_assignments', label: 'Asignado en Parte Diario (Ayudante/multi-persona)', sql: 'SELECT 1 FROM daily_board_assignments WHERE personnel_id = $1 LIMIT 1' },
+    { tabla: 'failure_reports', label: 'Supervisor en un Reporte de Falla', sql: 'SELECT 1 FROM failure_reports WHERE supervisor_id = $1 LIMIT 1' },
+    { tabla: 'failure_reports', label: 'Responsable de seguimiento en un Reporte de Falla', sql: 'SELECT 1 FROM failure_reports WHERE responsable_seguimiento_id = $1 LIMIT 1' }
+  ];
+  for (const check of checks) {
+    const result = await client.query(check.sql, [personnelId]);
+    if (result.rows.length > 0) return check.label;
   }
+  return null;
+}
+
+// Borra una persona de forma segura: limpia historial descartable primero,
+// y si sigue habiendo un bloqueo real devuelve el motivo en vez de tirar una excepcion generica.
+async function borrarPersonaSegura(personnelId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await limpiarHistorialDescartable(client, personnelId);
+
+    const bloqueo = await encontrarBloqueoReal(client, personnelId);
+    if (bloqueo) {
+      await client.query('ROLLBACK');
+      return { ok: false, motivo: bloqueo };
+    }
+
+    await client.query('DELETE FROM personnel WHERE id = $1', [personnelId]);
+    await client.query('COMMIT');
+    return { ok: true };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return { ok: false, motivo: err.message };
+  } finally {
+    client.release();
+  }
+}
+
+router.delete('/:id', requireRole('coordinador'), ah(async (req, res) => {
+  const resultado = await borrarPersonaSegura(req.params.id);
+  if (!resultado.ok) {
+    return res.status(400).json({
+      error: `No se puede eliminar: la persona sigue referenciada en "${resultado.motivo}". Reasigná o eliminá esas referencias primero, o marcala como inactiva en vez de borrarla.`
+    });
+  }
+  res.status(204).send();
 }));
 
 // PATCH /api/personnel/bulk-crew - asignar una cuadrilla a varias personas de una vez
