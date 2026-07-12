@@ -100,9 +100,36 @@ router.put('/:id', requireRole('coordinador'), ah(async (req, res) => {
   res.json(result.rows[0]);
 }));
 
+// DELETE /api/personnel/bulk - eliminar varias personas de una vez (Coordinador/Super)
+// IMPORTANTE: esta ruta va ANTES de /:id para que Express no la confunda con un id literal "bulk"
+router.delete('/bulk', requireRole('coordinador'), ah(async (req, res) => {
+  const { personnel_ids } = req.body;
+  if (!Array.isArray(personnel_ids) || personnel_ids.length === 0) {
+    return res.status(400).json({ error: 'personnel_ids (array) es requerido.' });
+  }
+  let deleted = 0;
+  const failed = [];
+  for (const id of personnel_ids) {
+    try {
+      await pool.query('DELETE FROM personnel WHERE id = $1', [id]);
+      deleted += 1;
+    } catch (err) {
+      failed.push(id);
+    }
+  }
+  res.json({ deleted, failed });
+}));
+
 router.delete('/:id', requireRole('coordinador'), ah(async (req, res) => {
-  await pool.query('DELETE FROM personnel WHERE id = $1', [req.params.id]);
-  res.status(204).send();
+  try {
+    await pool.query('DELETE FROM personnel WHERE id = $1', [req.params.id]);
+    res.status(204).send();
+  } catch (err) {
+    if (err.code === '23503') {
+      return res.status(400).json({ error: 'No se puede eliminar: esta persona todavia tiene datos relacionados que lo impiden.' });
+    }
+    throw err;
+  }
 }));
 
 // PATCH /api/personnel/bulk-crew - asignar una cuadrilla a varias personas de una vez
