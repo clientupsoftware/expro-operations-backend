@@ -102,6 +102,13 @@ router.post('/:id/assign-to-job/:jobId', requireRole('mantenimiento'), async (re
         [jobId, item.asset_id, kitId, req.user.id]
       );
       assigned.push(inserted.rows[0]);
+
+      // Toda asignacion a un Job cuenta como 1 operacion, sin importar el modelo del asset.
+      await client.query('UPDATE assets SET cumulative_operations = cumulative_operations + 1 WHERE id = $1', [item.asset_id]);
+      await client.query(
+        'INSERT INTO asset_runs (asset_id, job_id, source) VALUES ($1, $2, $3)',
+        [item.asset_id, jobId, 'job_assignment_operacion']
+      );
     }
 
     await client.query('COMMIT');

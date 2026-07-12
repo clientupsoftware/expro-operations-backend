@@ -57,7 +57,9 @@ router.get('/status/:assetId', async (req, res) => {
       [asset.id, rule.id]
     );
     const runsAtLastMaintenance = lastLog.rows[0] ? lastLog.rows[0].runs_at_time : 0;
+    const operationsAtLastMaintenance = lastLog.rows[0] ? (lastLog.rows[0].operations_at_time || 0) : 0;
     const runsSince = asset.cumulative_runs - runsAtLastMaintenance;
+    const operationsSince = asset.cumulative_operations - operationsAtLastMaintenance;
 
     status.push({
       rule_id: rule.id,
@@ -67,11 +69,19 @@ router.get('/status/:assetId', async (req, res) => {
       execution_location: rule.execution_location,
       task_description: rule.task_description,
       runs_since_last_maintenance: rule.trigger_type === 'runs' ? runsSince : null,
-      due: rule.trigger_type === 'runs' && rule.trigger_value ? runsSince >= rule.trigger_value : null
+      operations_since_last_maintenance: rule.trigger_type === 'operaciones' ? operationsSince : null,
+      due: rule.trigger_type === 'runs' && rule.trigger_value ? runsSince >= rule.trigger_value
+         : rule.trigger_type === 'operaciones' && rule.trigger_value ? operationsSince >= rule.trigger_value
+         : null
     });
   }
 
-  res.json({ asset_id: asset.id, cumulative_runs: asset.cumulative_runs, maintenance_status: status });
+  res.json({
+    asset_id: asset.id,
+    cumulative_runs: asset.cumulative_runs,
+    cumulative_operations: asset.cumulative_operations,
+    maintenance_status: status
+  });
 });
 
 // POST /api/maintenance/log - registrar que se realizo un mantenimiento (solo Mantenimiento)
@@ -80,13 +90,13 @@ router.post('/log', requireRole('mantenimiento'), async (req, res) => {
   if (!asset_id || !maintenance_rule_id) {
     return res.status(400).json({ error: 'asset_id y maintenance_rule_id son requeridos.' });
   }
-  const assetResult = await pool.query('SELECT cumulative_runs FROM assets WHERE id = $1', [asset_id]);
+  const assetResult = await pool.query('SELECT cumulative_runs, cumulative_operations FROM assets WHERE id = $1', [asset_id]);
   if (assetResult.rows.length === 0) return res.status(404).json({ error: 'Asset no encontrado.' });
 
   const result = await pool.query(
-    `INSERT INTO asset_maintenance_log (asset_id, maintenance_rule_id, runs_at_time, notes, logged_by)
-     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-    [asset_id, maintenance_rule_id, assetResult.rows[0].cumulative_runs, notes || null, req.user.id]
+    `INSERT INTO asset_maintenance_log (asset_id, maintenance_rule_id, runs_at_time, operations_at_time, notes, logged_by)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [asset_id, maintenance_rule_id, assetResult.rows[0].cumulative_runs, assetResult.rows[0].cumulative_operations, notes || null, req.user.id]
   );
   res.status(201).json(result.rows[0]);
 });

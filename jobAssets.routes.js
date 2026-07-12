@@ -25,11 +25,32 @@ router.post('/:jobId', requireRole('mantenimiento'), async (req, res) => {
   const { asset_id } = req.body;
   if (!asset_id) return res.status(400).json({ error: 'asset_id es requerido.' });
 
-  const result = await pool.query(
-    `INSERT INTO job_assets (job_id, asset_id, assigned_by) VALUES ($1, $2, $3) RETURNING *`,
-    [req.params.jobId, asset_id, req.user.id]
-  );
-  res.status(201).json(result.rows[0]);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const result = await client.query(
+      `INSERT INTO job_assets (job_id, asset_id, assigned_by) VALUES ($1, $2, $3) RETURNING *`,
+      [req.params.jobId, asset_id, req.user.id]
+    );
+
+    // Toda asignacion a un Job cuenta como 1 operacion para ese asset, sin importar el modelo.
+    // Esto es independiente del conteo de carreras (que sigue sumando solo via lineas/stages con RIH+POOH).
+    await client.query('UPDATE assets SET cumulative_operations = cumulative_operations + 1 WHERE id = $1', [asset_id]);
+    await client.query(
+      'INSERT INTO asset_runs (asset_id, job_id, source) VALUES ($1, $2, $3)',
+      [asset_id, req.params.jobId, 'job_assignment_operacion']
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al asignar el asset.' });
+  } finally {
+    client.release();
+  }
 });
 
 router.delete('/:jobId/:jobAssetId', requireRole('mantenimiento'), async (req, res) => {

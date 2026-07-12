@@ -22,7 +22,7 @@ router.get('/', async (req, res) => {
   const threshold = await getSemaphoreThreshold();
 
   let query = `
-    SELECT assets.*, equipment_catalog.category, equipment_catalog.model_description
+    SELECT assets.*, equipment_catalog.category, equipment_catalog.model_description, equipment_catalog.counting_mode
     FROM assets
     LEFT JOIN equipment_catalog ON equipment_catalog.id = assets.equipment_catalog_id
     WHERE 1=1
@@ -54,7 +54,7 @@ router.get('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
   const threshold = await getSemaphoreThreshold();
   const result = await pool.query(`
-    SELECT assets.*, equipment_catalog.category, equipment_catalog.model_description
+    SELECT assets.*, equipment_catalog.category, equipment_catalog.model_description, equipment_catalog.counting_mode
     FROM assets
     LEFT JOIN equipment_catalog ON equipment_catalog.id = assets.equipment_catalog_id
     WHERE assets.id = $1
@@ -183,6 +183,56 @@ router.post('/import-sap', requireRole('mantenimiento'), upload.single('file'), 
   }
 });
 
+// PATCH /api/assets/:id/reset-runs - resetea AMBOS contadores (carreras y operaciones) juntos,
+// ya que un reseteo representa un evento fisico (ej: cambio de componente interno) que afecta
+// a los dos por igual. Solo Super. Requiere un motivo, y deja historico de cuanto tenia antes.
+router.patch('/:id/reset-runs', requireRole('super'), async (req, res) => {
+  const { motivo } = req.body;
+  if (!motivo || !motivo.trim()) return res.status(400).json({ error: 'El motivo del reseteo es requerido.' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const assetResult = await client.query('SELECT * FROM assets WHERE id = $1 FOR UPDATE', [req.params.id]);
+    if (assetResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Asset no encontrado.' });
+    }
+    const asset = assetResult.rows[0];
+
+    await client.query(
+      'INSERT INTO asset_run_resets (asset_id, previous_count, previous_operations, motivo, reset_by) VALUES ($1, $2, $3, $4, $5)',
+      [asset.id, asset.cumulative_runs, asset.cumulative_operations, motivo.trim(), req.user.id]
+    );
+
+    const updated = await client.query(
+      'UPDATE assets SET cumulative_runs = 0, cumulative_operations = 0, counting_since = CURRENT_DATE, updated_at = now() WHERE id = $1 RETURNING *',
+      [req.params.id]
+    );
+
+    await client.query('COMMIT');
+    res.json(updated.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al resetear el contador.' });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/assets/:id/reset-history - historico de reseteos de este asset (todos los roles lo pueden ver)
+router.get('/:id/reset-history', async (req, res) => {
+  const result = await pool.query(`
+    SELECT asset_run_resets.*, users.name AS reset_by_name
+    FROM asset_run_resets
+    LEFT JOIN users ON users.id = asset_run_resets.reset_by
+    WHERE asset_id = $1
+    ORDER BY reset_at DESC
+  `, [req.params.id]);
+  res.json(result.rows);
+});
+
 // ---------- EQUIPMENT CATALOG (los "modelos" de equipo) ----------
 router.get('/catalog/all', async (req, res) => {
   const result = await pool.query('SELECT * FROM equipment_catalog ORDER BY category, model_description');
@@ -190,14 +240,29 @@ router.get('/catalog/all', async (req, res) => {
 });
 
 router.post('/catalog', requireRole('mantenimiento'), async (req, res) => {
-  const { category, model_description } = req.body;
+  const { category, model_description, counting_mode } = req.body;
   if (!model_description) return res.status(400).json({ error: 'model_description es requerido.' });
   const result = await pool.query(
-    `INSERT INTO equipment_catalog (category, model_description) VALUES ($1, $2)
+    `INSERT INTO equipment_catalog (category, model_description, counting_mode) VALUES ($1, $2, $3)
      ON CONFLICT (category, model_description) DO NOTHING RETURNING *`,
-    [category || null, model_description]
+    [category || null, model_description, counting_mode === 'operacion' ? 'operacion' : 'carrera']
   );
   res.status(201).json(result.rows[0] || { message: 'Ya existia en el catalogo.' });
+});
+
+// PUT /api/assets/catalog/:id - editar el modo de conteo de un modelo ya cargado (Mantenimiento)
+router.put('/catalog/:id', requireRole('mantenimiento'), async (req, res) => {
+  const { category, model_description, counting_mode } = req.body;
+  const result = await pool.query(
+    `UPDATE equipment_catalog SET
+       category = COALESCE($1, category),
+       model_description = COALESCE($2, model_description),
+       counting_mode = COALESCE($3, counting_mode)
+     WHERE id = $4 RETURNING *`,
+    [category || null, model_description || null, counting_mode || null, req.params.id]
+  );
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Modelo no encontrado.' });
+  res.json(result.rows[0]);
 });
 
 module.exports = router;
