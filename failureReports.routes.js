@@ -4,6 +4,7 @@ const router = express.Router();
 const pool = require('./db');
 const { requireAuth } = require('./authMiddleware');
 const { exportFailureReportToWord } = require('./failureReportExport');
+const { sendFailureReportNotification } = require('./emailService');
 
 // GET /api/failure-reports/:id  -> detalle completo con assets y fotos
 // GET /api/failure-reports/by-line/:lineId - lista liviana de los reportes ya cargados
@@ -68,8 +69,7 @@ router.post('/', requireAuth, async (req, res) => {
     );
     const reportId = insertReport.rows[0].id;
 
-    // TODO CONFIRMAR: nombre real de la tabla que vincula assets a una linea de time report.
-    // Uso 'time_report_line_assets' como supuesto - ajustar si el nombre real es otro.
+    // Assets fallados: acotados al subset de assets ya usados en esa linea del reporte de tiempos.
     if (asset_ids?.length) {
       const validAssets = await client.query(
         `SELECT asset_id FROM time_report_line_assets
@@ -87,6 +87,24 @@ router.post('/', requireAuth, async (req, res) => {
 
     await client.query('COMMIT');
     res.status(201).json({ id: reportId });
+
+    // Notificacion por mail: mejor esfuerzo, no bloquea ni hace fallar la respuesta si algo sale mal.
+    try {
+      const settingResult = await pool.query(
+        `SELECT value FROM settings WHERE key = 'failure_report_notify_emails'`
+      );
+      const recipients = settingResult.rows[0]?.value
+        ? settingResult.rows[0].value.split(',').map((e) => e.trim()).filter(Boolean)
+        : [];
+      if (recipients.length > 0) {
+        await sendFailureReportNotification(
+          { event_datetime, pozo_etapa, npt, clasificacion_nivel, descripcion_que_sucedio },
+          recipients
+        );
+      }
+    } catch (emailErr) {
+      console.error('No se pudo enviar la notificacion por mail del reporte de falla:', emailErr.message);
+    }
   } catch (err) {
     await client.query('ROLLBACK');
     console.error(err);
@@ -195,6 +213,28 @@ router.get('/:id/export', requireAuth, async (req, res) => {
 router.get('/assets/con-falla', requireAuth, async (req, res) => {
   const result = await pool.query('SELECT * FROM v_assets_con_falla');
   res.json(result.rows);
+});
+
+// GET /api/failure-reports/notify-emails - lista de emails que reciben aviso al crear un reporte
+router.get('/notify-emails', requireAuth, async (req, res) => {
+  const result = await pool.query(`SELECT value FROM settings WHERE key = 'failure_report_notify_emails'`);
+  const emails = result.rows[0]?.value
+    ? result.rows[0].value.split(',').map((e) => e.trim()).filter(Boolean)
+    : [];
+  res.json({ emails });
+});
+
+// PUT /api/failure-reports/notify-emails - actualiza la lista (array de strings)
+router.put('/notify-emails', requireAuth, async (req, res) => {
+  const { emails } = req.body;
+  if (!Array.isArray(emails)) return res.status(400).json({ error: 'emails (array) es requerido.' });
+  const value = emails.map((e) => e.trim()).filter(Boolean).join(',');
+  await pool.query(
+    `INSERT INTO settings (key, value) VALUES ('failure_report_notify_emails', $1)
+     ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [value]
+  );
+  res.json({ emails: value.split(',').filter(Boolean) });
 });
 
 module.exports = router;
