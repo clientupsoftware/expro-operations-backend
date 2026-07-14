@@ -19,6 +19,29 @@ router.get('/by-line/:lineId', requireAuth, async (req, res) => {
   res.json(result.rows);
 });
 
+// GET /api/failure-reports/notify-emails - lista de emails que reciben aviso al crear un reporte
+// (declarada antes de /:id a proposito: si no, /:id la intercepta interpretando "notify-emails" como un id)
+router.get('/notify-emails', requireAuth, async (req, res) => {
+  const result = await pool.query(`SELECT value FROM settings WHERE key = 'failure_report_notify_emails'`);
+  const emails = result.rows[0]?.value
+    ? result.rows[0].value.split(',').map((e) => e.trim()).filter(Boolean)
+    : [];
+  res.json({ emails });
+});
+
+// PUT /api/failure-reports/notify-emails - actualiza la lista (array de strings)
+router.put('/notify-emails', requireAuth, async (req, res) => {
+  const { emails } = req.body;
+  if (!Array.isArray(emails)) return res.status(400).json({ error: 'emails (array) es requerido.' });
+  const value = emails.map((e) => e.trim()).filter(Boolean).join(',');
+  await pool.query(
+    `INSERT INTO settings (key, value) VALUES ('failure_report_notify_emails', $1)
+     ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [value]
+  );
+  res.json({ emails: value.split(',').filter(Boolean) });
+});
+
 router.get('/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
   const report = await pool.query('SELECT * FROM failure_reports WHERE id = $1', [id]);
@@ -213,28 +236,6 @@ router.get('/:id/export', requireAuth, async (req, res) => {
 router.get('/assets/con-falla', requireAuth, async (req, res) => {
   const result = await pool.query('SELECT * FROM v_assets_con_falla');
   res.json(result.rows);
-});
-
-// GET /api/failure-reports/notify-emails - lista de emails que reciben aviso al crear un reporte
-router.get('/notify-emails', requireAuth, async (req, res) => {
-  const result = await pool.query(`SELECT value FROM settings WHERE key = 'failure_report_notify_emails'`);
-  const emails = result.rows[0]?.value
-    ? result.rows[0].value.split(',').map((e) => e.trim()).filter(Boolean)
-    : [];
-  res.json({ emails });
-});
-
-// PUT /api/failure-reports/notify-emails - actualiza la lista (array de strings)
-router.put('/notify-emails', requireAuth, async (req, res) => {
-  const { emails } = req.body;
-  if (!Array.isArray(emails)) return res.status(400).json({ error: 'emails (array) es requerido.' });
-  const value = emails.map((e) => e.trim()).filter(Boolean).join(',');
-  await pool.query(
-    `INSERT INTO settings (key, value) VALUES ('failure_report_notify_emails', $1)
-     ON CONFLICT (key) DO UPDATE SET value = $1`,
-    [value]
-  );
-  res.json({ emails: value.split(',').filter(Boolean) });
 });
 
 module.exports = router;
