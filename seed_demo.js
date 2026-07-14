@@ -1,11 +1,12 @@
 // seed_demo.js
 // Carga un set de datos 100% ficticios para el entorno de demostración.
-// Pensado para correr contra una base recien vaciada (ver reset_demo.js).
-require('dotenv').config();
+// Pensado para correr contra una base recien vaciada (ver demo.routes.js -> reset).
+// Se puede usar de 2 formas:
+//   1) Linea de comandos: node seed_demo.js
+//   2) Importado desde otro archivo: const { seedDemo } = require('./seed_demo'); await seedDemo(pool);
 const bcrypt = require('bcryptjs');
-const pool = require('./db');
 
-async function seed() {
+async function seedDemo(pool) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -303,17 +304,30 @@ async function seed() {
     }
 
     await client.query('COMMIT');
-    console.log('');
-    console.log('Seed de demo completo. Usuarios de acceso:');
-    users.forEach((u) => console.log(`  - ${u.email} / demo2026 (${u.role})`));
+    return users;
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Error en el seed de demo:', err);
-    process.exitCode = 1;
+    throw err;
   } finally {
     client.release();
-    await pool.end();
   }
 }
 
-seed();
+// Si se corre directo (node seed_demo.js), usa su propia conexion y despues cierra todo.
+if (require.main === module) {
+  require('dotenv').config();
+  const pool = require('./db');
+  seedDemo(pool)
+    .then((users) => {
+      console.log('');
+      console.log('Seed de demo completo. Usuarios de acceso:');
+      users.forEach((u) => console.log(`  - ${u.email} / demo2026 (${u.role})`));
+    })
+    .catch((err) => {
+      console.error('Error en el seed de demo:', err);
+      process.exitCode = 1;
+    })
+    .finally(() => pool.end());
+}
+
+module.exports = { seedDemo };

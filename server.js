@@ -50,6 +50,14 @@ app.use('/api/settings', settingsRoutes);
 app.use('/api/failure-reports', failureReportsRoutes);
 app.use('/api/stats', statsRoutes);
 
+// Rutas exclusivas del entorno de demostracion: solo existen si DEMO_MODE=true.
+// En produccion esta variable no esta seteada, asi que ni siquiera se monta la ruta.
+if (process.env.DEMO_MODE === 'true') {
+  const demoRoutes = require('./demo.routes');
+  app.use('/api/demo', demoRoutes);
+  console.log('DEMO_MODE activo: /api/demo/reset disponible.');
+}
+
 // Manejo generico de errores no capturados
 app.use((err, req, res, next) => {
   console.error(err);
