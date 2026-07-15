@@ -60,6 +60,70 @@ router.post('/', requireRole('mantenimiento'), async (req, res) => {
   }
 });
 
+// PATCH /api/kits/:id (Mantenimiento o Super)
+// Edita nombre/categoria y/o reemplaza por completo la composicion de assets del kit.
+// asset_ids, si viene, reemplaza TODO el listado anterior (no es un agregar/quitar incremental).
+router.patch('/:id', requireRole('mantenimiento'), async (req, res) => {
+  const { id } = req.params;
+  const { name, category, asset_ids } = req.body;
+
+  if (asset_ids !== undefined && (!Array.isArray(asset_ids) || asset_ids.length === 0)) {
+    return res.status(400).json({ error: 'Si mandas asset_ids, tiene que ser un array con al menos 1 elemento.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const setClauses = [];
+    const values = [];
+    if (name !== undefined) { values.push(name); setClauses.push(`name = $${values.length}`); }
+    if (category !== undefined) { values.push(category || null); setClauses.push(`category = $${values.length}`); }
+
+    let kit;
+    if (setClauses.length > 0) {
+      values.push(id);
+      const result = await client.query(
+        `UPDATE kit_templates SET ${setClauses.join(', ')} WHERE id = $${values.length} RETURNING *`,
+        values
+      );
+      if (result.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Kit no encontrado.' });
+      }
+      kit = result.rows[0];
+    }
+
+    if (asset_ids !== undefined) {
+      await client.query('DELETE FROM kit_template_items WHERE kit_template_id = $1', [id]);
+      for (const assetId of asset_ids) {
+        await client.query(
+          'INSERT INTO kit_template_items (kit_template_id, asset_id) VALUES ($1, $2)',
+          [id, assetId]
+        );
+      }
+    }
+
+    if (!kit) {
+      const current = await client.query('SELECT * FROM kit_templates WHERE id = $1', [id]);
+      if (current.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Kit no encontrado.' });
+      }
+      kit = current.rows[0];
+    }
+
+    await client.query('COMMIT');
+    res.json(kit);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al editar el kit.' });
+  } finally {
+    client.release();
+  }
+});
+
 // DELETE /api/kits/:id (Mantenimiento o Super)
 router.delete('/:id', requireRole('mantenimiento'), async (req, res) => {
   await pool.query('DELETE FROM kit_templates WHERE id = $1', [req.params.id]);
