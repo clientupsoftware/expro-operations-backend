@@ -20,6 +20,9 @@ const maintenanceRoutes = require('./maintenance.routes');
 const settingsRoutes = require('./settings.routes');
 const failureReportsRoutes = require('./failureReports.routes');
 const statsRoutes = require('./stats.routes');
+const assetAlertsRoutes = require('./assetAlerts.routes');
+const cron = require('node-cron');
+const { checkAssetAlerts } = require('./assetAlertChecker');
 
 const app = express();
 
@@ -49,6 +52,7 @@ app.use('/api/maintenance', maintenanceRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/failure-reports', failureReportsRoutes);
 app.use('/api/stats', statsRoutes);
+app.use('/api/asset-alerts', assetAlertsRoutes);
 
 // Rutas exclusivas del entorno de demostracion: solo existen si DEMO_MODE=true.
 // En produccion esta variable no esta seteada, asi que ni siquiera se monta la ruta.
@@ -67,4 +71,18 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`WellOps API corriendo en el puerto ${PORT}`);
+});
+
+// Chequeo periodico de alertas de assets (carreras/operaciones vs umbral configurado).
+// Cada 15 minutos alcanza de sobra - estos contadores no cambian a una velocidad
+// que justifique algo mas frecuente, y asi no se satura la base con chequeos innecesarios.
+cron.schedule('*/15 * * * *', async () => {
+  try {
+    const result = await checkAssetAlerts();
+    if (result.triggered > 0) {
+      console.log(`Chequeo de alertas de assets: ${result.triggered} alerta(s) disparada(s) de ${result.checked} regla(s) activa(s).`);
+    }
+  } catch (err) {
+    console.error('Error en el chequeo periodico de alertas de assets:', err);
+  }
 });
