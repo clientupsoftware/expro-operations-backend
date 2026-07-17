@@ -68,6 +68,63 @@ router.post('/templates', requireRole('coordinador'), async (req, res) => {
   }
 });
 
+// PATCH /api/briefing/templates/:id - editar nombre y/o reemplazar las preguntas (reemplazo total, como Kits)
+router.patch('/templates/:id', requireRole('coordinador'), async (req, res) => {
+  const { id } = req.params;
+  const { nombre, items } = req.body;
+
+  if (items !== undefined && (!Array.isArray(items) || items.length === 0)) {
+    return res.status(400).json({ error: 'Si mandas items, tiene que ser un array con al menos 1 pregunta.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    let template;
+    if (nombre !== undefined) {
+      const result = await client.query(
+        'UPDATE briefing_templates SET nombre = $1 WHERE id = $2 RETURNING *',
+        [nombre, id]
+      );
+      if (result.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Plantilla no encontrada.' });
+      }
+      template = result.rows[0];
+    }
+
+    if (items !== undefined) {
+      await client.query('DELETE FROM briefing_template_items WHERE template_id = $1', [id]);
+      let orden = 0;
+      for (const item of items) {
+        await client.query(
+          'INSERT INTO briefing_template_items (template_id, pregunta, orden) VALUES ($1, $2, $3)',
+          [id, item.pregunta, orden++]
+        );
+      }
+    }
+
+    if (!template) {
+      const current = await client.query('SELECT * FROM briefing_templates WHERE id = $1', [id]);
+      if (current.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Plantilla no encontrada.' });
+      }
+      template = current.rows[0];
+    }
+
+    await client.query('COMMIT');
+    res.json(template);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al editar la plantilla.' });
+  } finally {
+    client.release();
+  }
+});
+
 // DELETE /api/briefing/templates/:id
 router.delete('/templates/:id', requireRole('coordinador'), async (req, res) => {
   await pool.query('DELETE FROM briefing_templates WHERE id = $1', [req.params.id]);
