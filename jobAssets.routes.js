@@ -69,6 +69,19 @@ router.patch('/:jobId/:jobAssetId/confirm', requireRole('coordinador', 'ingenier
   res.json(result.rows[0]);
 });
 
+// PATCH /api/job-assets/:jobId/:jobAssetId/requirement - indica a que requerimiento del Job
+// corresponde este asset asignado. required_tool_id null = "sin asignar" (desetiquetarlo).
+router.patch('/:jobId/:jobAssetId/requirement', requireRole('coordinador', 'mantenimiento', 'ingeniero'), async (req, res) => {
+  const { required_tool_id } = req.body;
+  const result = await pool.query(
+    `UPDATE job_assets SET required_tool_id = $1
+     WHERE id = $2 AND job_id = $3 RETURNING *`,
+    [required_tool_id || null, req.params.jobAssetId, req.params.jobId]
+  );
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Asignacion no encontrada.' });
+  res.json(result.rows[0]);
+});
+
 // POST /api/job-assets/:jobId/generate-shipping-list
 // Genera la Shipping List a partir de todos los job_assets confirmados de ese job.
 router.post('/:jobId/generate-shipping-list', requireRole('coordinador', 'ingeniero'), async (req, res) => {

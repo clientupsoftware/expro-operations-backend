@@ -22,6 +22,7 @@ const failureReportsRoutes = require('./failureReports.routes');
 const statsRoutes = require('./stats.routes');
 const assetAlertsRoutes = require('./assetAlerts.routes');
 const briefingRoutes = require('./briefing.routes');
+const serviceRequirementsRoutes = require('./serviceRequirements.routes');
 const cron = require('node-cron');
 const { checkAssetAlerts } = require('./assetAlertChecker');
 
@@ -55,6 +56,7 @@ app.use('/api/failure-reports', failureReportsRoutes);
 app.use('/api/stats', statsRoutes);
 app.use('/api/asset-alerts', assetAlertsRoutes);
 app.use('/api/briefing', briefingRoutes);
+app.use('/api/service-requirements', serviceRequirementsRoutes);
 
 // Rutas exclusivas del entorno de demostracion: solo existen si DEMO_MODE=true.
 // En produccion esta variable no esta seteada, asi que ni siquiera se monta la ruta.

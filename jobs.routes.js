@@ -149,6 +149,22 @@ router.post('/', requireRole('coordinador'), async (req, res) => {
       await client.query('INSERT INTO job_services (job_id, service_id) VALUES ($1, $2)', [job.id, serviceId]);
     }
 
+    // Precarga de requerimientos: copia los predefinidos de cada servicio elegido a este Job.
+    // Es una copia (no una referencia viva) - se puede agregar o quitar libremente despues
+    // sin afectar la plantilla del servicio, y editar la plantilla despues no cambia este Job.
+    for (const serviceId of service_ids) {
+      const defaultsResult = await client.query(
+        'SELECT tool_description, quantity FROM service_default_requirements WHERE service_id = $1 ORDER BY orden',
+        [serviceId]
+      );
+      for (const def of defaultsResult.rows) {
+        await client.query(
+          'INSERT INTO required_tools (job_id, tool_description, quantity, requested_by) VALUES ($1, $2, $3, $4)',
+          [job.id, def.tool_description, def.quantity, req.user.id]
+        );
+      }
+    }
+
     await client.query('COMMIT');
     res.status(201).json(job);
   } catch (err) {
