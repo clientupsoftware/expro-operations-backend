@@ -141,15 +141,15 @@ async function getProgramDetail(programId) {
         sumar(typology.tapon_carga_poder_id, 1 * etapas);
       }
       for (const config of typology.configs) {
-        const clusters = config.cantidad_clusters || 0;
-        sumar(config.explosive_type_id, clusters * (config.cargas_por_cluster || 0) * etapas);
-        sumar(config.detonador_type_id, clusters * 1 * etapas);
-        sumar(config.cordon_type_id, clusters * (config.cordon_cantidad_por_cluster || 0) * etapas);
+        const cantidad = config.gun_quantity || 0;
+        sumar(config.charge_type_id, cantidad * (config.quantity_charges_per_gun || 0) * etapas);
+        sumar(config.detonator_type_id, cantidad * 1 * etapas);
+        sumar(config.detonating_cord_type_id, cantidad * (config.detonating_cord_length_m || 0) * etapas);
       }
     }
   }
 
-  return { ...program, wells, consumo_total: Object.values(consumoPorTipo) };
+  return { ...program, wells, consumo_total: Object.values(consumoPorTipo).map((c) => ({ ...c, cantidad: Math.round(c.cantidad * 1000) / 1000 })) };
 }
 
 router.get('/programs/:id', async (req, res) => {
@@ -187,18 +187,20 @@ async function insertWells(client, programId, wells) {
 
       let configOrden = 0;
       for (const config of (typology.configs || [])) {
-        if (!config.explosive_type_id) continue; // obligatorio, se descarta silenciosamente si falta
+        if (!config.charge_type_id) continue; // obligatorio, se descarta silenciosamente si falta
         await client.query(
           `INSERT INTO explosive_program_configs
-            (typology_id, explosive_type_id, diametro_canon, cantidad_clusters, largo_cluster_ft,
-             spf, fase, cargas_por_cluster, detonador_type_id, cordon_type_id, cordon_cantidad_por_cluster, tpn, orden)
+            (typology_id, charge_type_id, gun_od, gun_quantity, gun_length_m,
+             gun_phase, spf, perforating_length_m, quantity_charges_per_gun,
+             detonator_type_id, detonating_cord_type_id, detonating_cord_length_m, orden)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
           [
-            typologyId, config.explosive_type_id, config.diametro_canon || null,
-            config.cantidad_clusters || null, config.largo_cluster_ft || null, config.spf || null,
-            config.fase || null, config.cargas_por_cluster || null,
-            config.detonador_type_id || null, config.cordon_type_id || null, config.cordon_cantidad_por_cluster || null,
-            config.tpn === 'N' ? 'N' : 'Y', configOrden++
+            typologyId, config.charge_type_id, config.gun_od || null,
+            config.gun_quantity || null, config.gun_length_m || null,
+            config.gun_phase || null, config.spf || null, config.perforating_length_m || null,
+            config.quantity_charges_per_gun || null,
+            config.detonator_type_id || null, config.detonating_cord_type_id || null, config.detonating_cord_length_m || null,
+            configOrden++
           ]
         );
       }
