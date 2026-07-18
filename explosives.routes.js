@@ -48,6 +48,143 @@ router.delete('/types/:id', requireRole('mantenimiento'), async (req, res) => {
   res.status(204).send();
 });
 
+// ================= TIPOLOGIAS DE CARRERAS (catalogo, reusable entre programas) =================
+
+router.get('/typologies', async (req, res) => {
+  const typologiesResult = await pool.query('SELECT * FROM explosive_typologies ORDER BY nombre');
+  const typologies = typologiesResult.rows;
+  if (typologies.length === 0) return res.json([]);
+
+  const typologyIds = typologies.map((t) => t.id);
+  const configsResult = await pool.query(
+    'SELECT * FROM explosive_typology_configs WHERE typology_id = ANY($1::int[]) ORDER BY orden',
+    [typologyIds]
+  );
+
+  res.json(typologies.map((t) => ({
+    ...t,
+    configs: configsResult.rows.filter((c) => c.typology_id === t.id)
+  })));
+});
+
+async function insertTypologyConfigs(client, typologyId, configs) {
+  let orden = 0;
+  for (const config of (configs || [])) {
+    if (!config.charge_type_id) continue; // obligatorio, se descarta silenciosamente si falta
+    await client.query(
+      `INSERT INTO explosive_typology_configs
+        (typology_id, charge_type_id, gun_od, gun_quantity, gun_length_m,
+         gun_phase, spf, perforating_length_m, quantity_charges_per_gun,
+         detonator_type_id, detonating_cord_type_id, detonating_cord_length_m, orden)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [
+        typologyId, config.charge_type_id, config.gun_od || null,
+        config.gun_quantity || null, config.gun_length_m || null,
+        config.gun_phase || null, config.spf || null, config.perforating_length_m || null,
+        config.quantity_charges_per_gun || null,
+        config.detonator_type_id || null, config.detonating_cord_type_id || null, config.detonating_cord_length_m || null,
+        orden++
+      ]
+    );
+  }
+}
+
+router.post('/typologies', requireRole('mantenimiento'), async (req, res) => {
+  const { nombre, tiene_tapon, tapon_detonador_primario_id, tapon_detonador_secundario_id, tapon_carga_poder_id, configs } = req.body;
+  if (!nombre) return res.status(400).json({ error: 'nombre es requerido.' });
+  if (!Array.isArray(configs) || configs.length === 0) {
+    return res.status(400).json({ error: 'configs (array, al menos 1 configuracion de gun) es requerido.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const tieneTapon = tiene_tapon !== false;
+    const typologyResult = await client.query(
+      `INSERT INTO explosive_typologies
+        (nombre, tiene_tapon, tapon_detonador_primario_id, tapon_detonador_secundario_id, tapon_carga_poder_id, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [
+        nombre, tieneTapon,
+        tieneTapon ? (tapon_detonador_primario_id || null) : null,
+        tieneTapon ? (tapon_detonador_secundario_id || null) : null,
+        tieneTapon ? (tapon_carga_poder_id || null) : null,
+        req.user.id
+      ]
+    );
+    const typologyId = typologyResult.rows[0].id;
+    await insertTypologyConfigs(client, typologyId, configs);
+    await client.query('COMMIT');
+
+    const full = await pool.query('SELECT * FROM explosive_typologies WHERE id = $1', [typologyId]);
+    const fullConfigs = await pool.query('SELECT * FROM explosive_typology_configs WHERE typology_id = $1 ORDER BY orden', [typologyId]);
+    res.status(201).json({ ...full.rows[0], configs: fullConfigs.rows });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al crear la tipología.' });
+  } finally {
+    client.release();
+  }
+});
+
+router.patch('/typologies/:id', requireRole('mantenimiento'), async (req, res) => {
+  const { id } = req.params;
+  const { nombre, tiene_tapon, tapon_detonador_primario_id, tapon_detonador_secundario_id, tapon_carga_poder_id, configs } = req.body;
+
+  if (configs !== undefined && (!Array.isArray(configs) || configs.length === 0)) {
+    return res.status(400).json({ error: 'Si mandas configs, tiene que ser un array con al menos 1 elemento.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const setClauses = [];
+    const values = [];
+    if (nombre !== undefined) { values.push(nombre); setClauses.push(`nombre = $${values.length}`); }
+    if (tiene_tapon !== undefined) {
+      values.push(tiene_tapon); setClauses.push(`tiene_tapon = $${values.length}`);
+      values.push(tiene_tapon ? (tapon_detonador_primario_id || null) : null); setClauses.push(`tapon_detonador_primario_id = $${values.length}`);
+      values.push(tiene_tapon ? (tapon_detonador_secundario_id || null) : null); setClauses.push(`tapon_detonador_secundario_id = $${values.length}`);
+      values.push(tiene_tapon ? (tapon_carga_poder_id || null) : null); setClauses.push(`tapon_carga_poder_id = $${values.length}`);
+    }
+
+    if (setClauses.length > 0) {
+      values.push(id);
+      const result = await client.query(
+        `UPDATE explosive_typologies SET ${setClauses.join(', ')} WHERE id = $${values.length} RETURNING id`,
+        values
+      );
+      if (result.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Tipología no encontrada.' });
+      }
+    }
+
+    if (Array.isArray(configs)) {
+      await client.query('DELETE FROM explosive_typology_configs WHERE typology_id = $1', [id]);
+      await insertTypologyConfigs(client, id, configs);
+    }
+
+    await client.query('COMMIT');
+    const full = await pool.query('SELECT * FROM explosive_typologies WHERE id = $1', [id]);
+    const fullConfigs = await pool.query('SELECT * FROM explosive_typology_configs WHERE typology_id = $1 ORDER BY orden', [id]);
+    res.json({ ...full.rows[0], configs: fullConfigs.rows });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al editar la tipología.' });
+  } finally {
+    client.release();
+  }
+});
+
+router.delete('/typologies/:id', requireRole('mantenimiento'), async (req, res) => {
+  await pool.query('DELETE FROM explosive_typologies WHERE id = $1', [req.params.id]);
+  res.status(204).send();
+});
+
 // ================= PROGRAMAS =================
 
 // GET /api/explosives/programs?from=&to=&cliente_id= - lista con filtros, resumen anidado
@@ -82,8 +219,9 @@ router.get('/programs', async (req, res) => {
   })));
 });
 
-// Trae el detalle completo (pozos -> tipologias -> configuraciones) de un programa,
-// mas el consumo total por tipo de explosivo en todo el programa.
+// Trae el detalle completo de un programa: pozos -> vinculos a Tipologias (cada uno con
+// su propia cantidad de etapas) -> la Tipologia real viene del catalogo (con sus configs).
+// Ademas calcula el consumo total por tipo de explosivo en todo el programa.
 async function getProgramDetail(programId) {
   const programResult = await pool.query(`
     SELECT explosive_programs.*, clients.name AS cliente_nombre
@@ -97,32 +235,37 @@ async function getProgramDetail(programId) {
   const wellsResult = await pool.query('SELECT * FROM explosive_program_wells WHERE program_id = $1 ORDER BY orden', [program.id]);
   const wellIds = wellsResult.rows.map((w) => w.id);
 
-  const typologiesResult = wellIds.length
-    ? await pool.query('SELECT * FROM explosive_program_typologies WHERE program_well_id = ANY($1::int[]) ORDER BY orden', [wellIds])
+  const linksResult = wellIds.length
+    ? await pool.query('SELECT * FROM explosive_program_well_typologies WHERE program_well_id = ANY($1::int[]) ORDER BY orden', [wellIds])
     : { rows: [] };
-  const typologyIds = typologiesResult.rows.map((t) => t.id);
 
+  const typologyIds = [...new Set(linksResult.rows.map((l) => l.typology_id))];
+  const typologiesResult = typologyIds.length
+    ? await pool.query('SELECT * FROM explosive_typologies WHERE id = ANY($1::int[])', [typologyIds])
+    : { rows: [] };
   const configsResult = typologyIds.length
-    ? await pool.query('SELECT * FROM explosive_program_configs WHERE typology_id = ANY($1::int[]) ORDER BY orden', [typologyIds])
+    ? await pool.query('SELECT * FROM explosive_typology_configs WHERE typology_id = ANY($1::int[]) ORDER BY orden', [typologyIds])
     : { rows: [] };
 
   const typesResult = await pool.query('SELECT id, descripcion FROM explosive_types');
   const typeDescById = {};
   typesResult.rows.forEach((t) => { typeDescById[t.id] = t.descripcion; });
 
+  const typologiesById = {};
+  typologiesResult.rows.forEach((t) => {
+    typologiesById[t.id] = { ...t, configs: configsResult.rows.filter((c) => c.typology_id === t.id) };
+  });
+
   const wells = wellsResult.rows.map((w) => ({
     ...w,
-    typologies: typologiesResult.rows
-      .filter((t) => t.program_well_id === w.id)
-      .map((t) => ({ ...t, configs: configsResult.rows.filter((c) => c.typology_id === t.id) }))
+    typology_links: linksResult.rows
+      .filter((l) => l.program_well_id === w.id)
+      .map((l) => ({ ...l, typology: typologiesById[l.typology_id] || null }))
   }));
 
-  // Consumo total por tipo de explosivo en todo el programa. Dos fuentes por etapa:
-  // 1) El Tapon (si tiene_tapon): 1 detonador primario + 1 secundario + 1 carga de poder,
-  //    una sola vez por etapa (no depende de la cantidad de clusters).
-  // 2) Cada Configuracion de cluster: (cargas_por_cluster) cargas + 1 detonador + cordon
-  //    detonante, todo multiplicado por cantidad_clusters de esa config.
-  // Todo eso, a su vez, multiplicado por cantidad_etapas del Pozo.
+  // Consumo total por tipo de explosivo en todo el programa. Por cada vinculo Pozo-Tipologia,
+  // usando su propia cantidad_etapas: Tapon (si aplica, 1 vez por etapa) + cada Config de la
+  // Tipologia (gun_quantity * cargas/detonador/cordon, por etapa).
   const consumoPorTipo = {};
   function sumar(typeId, cantidad) {
     if (!typeId || !cantidad) return;
@@ -133,8 +276,11 @@ async function getProgramDetail(programId) {
   }
 
   for (const well of wells) {
-    const etapas = well.cantidad_etapas || 0;
-    for (const typology of well.typologies) {
+    for (const link of well.typology_links) {
+      const etapas = link.cantidad_etapas || 0;
+      const typology = link.typology;
+      if (!typology) continue;
+
       if (typology.tiene_tapon) {
         sumar(typology.tapon_detonador_primario_id, 1 * etapas);
         sumar(typology.tapon_detonador_secundario_id, 1 * etapas);
@@ -149,7 +295,11 @@ async function getProgramDetail(programId) {
     }
   }
 
-  return { ...program, wells, consumo_total: Object.values(consumoPorTipo).map((c) => ({ ...c, cantidad: Math.round(c.cantidad * 1000) / 1000 })) };
+  return {
+    ...program,
+    wells,
+    consumo_total: Object.values(consumoPorTipo).map((c) => ({ ...c, cantidad: Math.round(c.cantidad * 1000) / 1000 }))
+  };
 }
 
 router.get('/programs/:id', async (req, res) => {
@@ -158,52 +308,23 @@ router.get('/programs/:id', async (req, res) => {
   res.json(detail);
 });
 
-// Inserta wells -> typologies -> configs para un programa (usado por POST y PATCH)
+// Inserta wells -> vinculos a Tipologias (cada uno con su propia cantidad_etapas)
 async function insertWells(client, programId, wells) {
   let wellOrden = 0;
   for (const well of wells) {
     const wellResult = await client.query(
-      'INSERT INTO explosive_program_wells (program_id, pozo, cantidad_etapas, orden) VALUES ($1,$2,$3,$4) RETURNING id',
-      [programId, well.pozo, well.cantidad_etapas || null, wellOrden++]
+      'INSERT INTO explosive_program_wells (program_id, pozo, orden) VALUES ($1,$2,$3) RETURNING id',
+      [programId, well.pozo, wellOrden++]
     );
     const wellId = wellResult.rows[0].id;
 
-    let typologyOrden = 0;
-    for (const typology of (well.typologies || [])) {
-      const tieneTapon = typology.tiene_tapon !== false; // default true
-      const typologyResult = await client.query(
-        `INSERT INTO explosive_program_typologies
-          (program_well_id, nombre, tiene_tapon, tapon_detonador_primario_id, tapon_detonador_secundario_id, tapon_carga_poder_id, orden)
-         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-        [
-          wellId, typology.nombre || null, tieneTapon,
-          tieneTapon ? (typology.tapon_detonador_primario_id || null) : null,
-          tieneTapon ? (typology.tapon_detonador_secundario_id || null) : null,
-          tieneTapon ? (typology.tapon_carga_poder_id || null) : null,
-          typologyOrden++
-        ]
+    let linkOrden = 0;
+    for (const link of (well.typology_links || [])) {
+      if (!link.typology_id) continue; // obligatorio, se descarta silenciosamente si falta
+      await client.query(
+        'INSERT INTO explosive_program_well_typologies (program_well_id, typology_id, cantidad_etapas, orden) VALUES ($1,$2,$3,$4)',
+        [wellId, link.typology_id, link.cantidad_etapas || 0, linkOrden++]
       );
-      const typologyId = typologyResult.rows[0].id;
-
-      let configOrden = 0;
-      for (const config of (typology.configs || [])) {
-        if (!config.charge_type_id) continue; // obligatorio, se descarta silenciosamente si falta
-        await client.query(
-          `INSERT INTO explosive_program_configs
-            (typology_id, charge_type_id, gun_od, gun_quantity, gun_length_m,
-             gun_phase, spf, perforating_length_m, quantity_charges_per_gun,
-             detonator_type_id, detonating_cord_type_id, detonating_cord_length_m, orden)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-          [
-            typologyId, config.charge_type_id, config.gun_od || null,
-            config.gun_quantity || null, config.gun_length_m || null,
-            config.gun_phase || null, config.spf || null, config.perforating_length_m || null,
-            config.quantity_charges_per_gun || null,
-            config.detonator_type_id || null, config.detonating_cord_type_id || null, config.detonating_cord_length_m || null,
-            configOrden++
-          ]
-        );
-      }
     }
   }
 }
