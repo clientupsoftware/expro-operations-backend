@@ -75,70 +75,115 @@ router.get('/programs', async (req, res) => {
     `SELECT * FROM explosive_program_wells WHERE program_id = ANY($1::int[]) ORDER BY orden`,
     [programIds]
   );
-  const wellIds = wellsResult.rows.map((w) => w.id);
-  const runsResult = wellIds.length
-    ? await pool.query(`SELECT * FROM explosive_program_runs WHERE program_well_id = ANY($1::int[]) ORDER BY orden`, [wellIds])
-    : { rows: [] };
 
   res.json(programs.map((p) => ({
     ...p,
-    wells: wellsResult.rows
-      .filter((w) => w.program_id === p.id)
-      .map((w) => ({ ...w, runs: runsResult.rows.filter((r) => r.program_well_id === w.id) }))
+    wells: wellsResult.rows.filter((w) => w.program_id === p.id)
   })));
 });
 
-// GET /api/explosives/programs/:id - un programa puntual, con todo su detalle
-router.get('/programs/:id', async (req, res) => {
+// Trae el detalle completo (pozos -> tipologias -> configuraciones) de un programa,
+// mas el consumo total por tipo de explosivo en todo el programa.
+async function getProgramDetail(programId) {
   const programResult = await pool.query(`
     SELECT explosive_programs.*, clients.name AS cliente_nombre
     FROM explosive_programs
     LEFT JOIN clients ON clients.id = explosive_programs.cliente_id
     WHERE explosive_programs.id = $1
-  `, [req.params.id]);
-  if (programResult.rows.length === 0) return res.status(404).json({ error: 'Programa no encontrado.' });
+  `, [programId]);
+  if (programResult.rows.length === 0) return null;
   const program = programResult.rows[0];
 
   const wellsResult = await pool.query('SELECT * FROM explosive_program_wells WHERE program_id = $1 ORDER BY orden', [program.id]);
   const wellIds = wellsResult.rows.map((w) => w.id);
-  const runsResult = wellIds.length
-    ? await pool.query('SELECT * FROM explosive_program_runs WHERE program_well_id = ANY($1::int[]) ORDER BY orden', [wellIds])
+
+  const typologiesResult = wellIds.length
+    ? await pool.query('SELECT * FROM explosive_program_typologies WHERE program_well_id = ANY($1::int[]) ORDER BY orden', [wellIds])
+    : { rows: [] };
+  const typologyIds = typologiesResult.rows.map((t) => t.id);
+
+  const configsResult = typologyIds.length
+    ? await pool.query(`
+        SELECT explosive_program_configs.*, explosive_types.descripcion AS explosive_type_descripcion
+        FROM explosive_program_configs
+        JOIN explosive_types ON explosive_types.id = explosive_program_configs.explosive_type_id
+        WHERE typology_id = ANY($1::int[]) ORDER BY orden
+      `, [typologyIds])
     : { rows: [] };
 
-  res.json({
-    ...program,
-    wells: wellsResult.rows.map((w) => ({ ...w, runs: runsResult.rows.filter((r) => r.program_well_id === w.id) }))
-  });
+  const wells = wellsResult.rows.map((w) => ({
+    ...w,
+    typologies: typologiesResult.rows
+      .filter((t) => t.program_well_id === w.id)
+      .map((t) => ({ ...t, configs: configsResult.rows.filter((c) => c.typology_id === t.id) }))
+  }));
+
+  // Consumo total por tipo de explosivo en todo el programa:
+  // por cada config, (cantidad_clusters * cargas_por_cluster) * cantidad_etapas del Pozo al que pertenece,
+  // sumado agrupando por tipo de explosivo.
+  const consumoPorTipo = {};
+  for (const well of wells) {
+    const etapas = well.cantidad_etapas || 0;
+    for (const typology of well.typologies) {
+      for (const config of typology.configs) {
+        const cantidadPorEtapa = (config.cantidad_clusters || 0) * (config.cargas_por_cluster || 0);
+        const total = cantidadPorEtapa * etapas;
+        const key = config.explosive_type_id;
+        if (!consumoPorTipo[key]) {
+          consumoPorTipo[key] = { explosive_type_id: key, descripcion: config.explosive_type_descripcion, cantidad: 0 };
+        }
+        consumoPorTipo[key].cantidad += total;
+      }
+    }
+  }
+
+  return { ...program, wells, consumo_total: Object.values(consumoPorTipo) };
+}
+
+router.get('/programs/:id', async (req, res) => {
+  const detail = await getProgramDetail(req.params.id);
+  if (!detail) return res.status(404).json({ error: 'Programa no encontrado.' });
+  res.json(detail);
 });
 
-// Inserta wells + runs para un programa (usado por POST y PATCH)
+// Inserta wells -> typologies -> configs para un programa (usado por POST y PATCH)
 async function insertWells(client, programId, wells) {
   let wellOrden = 0;
   for (const well of wells) {
     const wellResult = await client.query(
-      'INSERT INTO explosive_program_wells (program_id, pozo, orden) VALUES ($1,$2,$3) RETURNING id',
-      [programId, well.pozo, wellOrden++]
+      'INSERT INTO explosive_program_wells (program_id, pozo, cantidad_etapas, orden) VALUES ($1,$2,$3,$4) RETURNING id',
+      [programId, well.pozo, well.cantidad_etapas || null, wellOrden++]
     );
     const wellId = wellResult.rows[0].id;
-    let runOrden = 0;
-    for (const run of (well.runs || [])) {
-      await client.query(
-        `INSERT INTO explosive_program_runs
-          (program_well_id, nombre, cantidad_etapas, diametro_canon, cantidad_clusters,
-           largo_cluster_ft, spf, fase, cargas_por_cluster, tipo_bala, tpn, orden)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-        [
-          wellId, run.nombre || null, run.cantidad_etapas || null, run.diametro_canon || null,
-          run.cantidad_clusters || null, run.largo_cluster_ft || null, run.spf || null,
-          run.fase || null, run.cargas_por_cluster || null, run.tipo_bala || null,
-          run.tpn === 'N' ? 'N' : 'Y', runOrden++
-        ]
+
+    let typologyOrden = 0;
+    for (const typology of (well.typologies || [])) {
+      const typologyResult = await client.query(
+        'INSERT INTO explosive_program_typologies (program_well_id, nombre, orden) VALUES ($1,$2,$3) RETURNING id',
+        [wellId, typology.nombre || null, typologyOrden++]
       );
+      const typologyId = typologyResult.rows[0].id;
+
+      let configOrden = 0;
+      for (const config of (typology.configs || [])) {
+        if (!config.explosive_type_id) continue; // obligatorio, se descarta silenciosamente si falta
+        await client.query(
+          `INSERT INTO explosive_program_configs
+            (typology_id, explosive_type_id, diametro_canon, cantidad_clusters, largo_cluster_ft,
+             spf, fase, cargas_por_cluster, tpn, orden)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+          [
+            typologyId, config.explosive_type_id, config.diametro_canon || null,
+            config.cantidad_clusters || null, config.largo_cluster_ft || null, config.spf || null,
+            config.fase || null, config.cargas_por_cluster || null,
+            config.tpn === 'N' ? 'N' : 'Y', configOrden++
+          ]
+        );
+      }
     }
   }
 }
 
-// POST /api/explosives/programs - crear un programa completo (pozos + carreras incluidos)
 router.post('/programs', requireRole('mantenimiento'), async (req, res) => {
   const { fecha, nombre, cliente_id, pad, wells } = req.body;
   if (!Array.isArray(wells) || wells.length === 0) {
@@ -150,15 +195,16 @@ router.post('/programs', requireRole('mantenimiento'), async (req, res) => {
     await client.query('BEGIN');
     const programResult = await client.query(
       `INSERT INTO explosive_programs (fecha, nombre, cliente_id, pad, created_by)
-       VALUES (COALESCE($1, CURRENT_DATE), $2, $3, $4, $5) RETURNING *`,
+       VALUES (COALESCE($1, CURRENT_DATE), $2, $3, $4, $5) RETURNING id`,
       [fecha || null, nombre || null, cliente_id || null, pad || null, req.user.id]
     );
-    const program = programResult.rows[0];
+    const programId = programResult.rows[0].id;
 
-    await insertWells(client, program.id, wells);
+    await insertWells(client, programId, wells);
 
     await client.query('COMMIT');
-    res.status(201).json(program);
+    const detail = await getProgramDetail(programId);
+    res.status(201).json(detail);
   } catch (err) {
     await client.query('ROLLBACK');
     console.error(err);
@@ -168,7 +214,6 @@ router.post('/programs', requireRole('mantenimiento'), async (req, res) => {
   }
 });
 
-// PATCH /api/explosives/programs/:id - editar datos generales y/o reemplazar pozos+carreras
 router.patch('/programs/:id', requireRole('mantenimiento'), async (req, res) => {
   const { id } = req.params;
   const { fecha, nombre, cliente_id, pad, wells } = req.body;
@@ -206,9 +251,8 @@ router.patch('/programs/:id', requireRole('mantenimiento'), async (req, res) => 
     }
 
     await client.query('COMMIT');
-
-    const updated = await pool.query('SELECT * FROM explosive_programs WHERE id = $1', [id]);
-    res.json(updated.rows[0]);
+    const detail = await getProgramDetail(id);
+    res.json(detail);
   } catch (err) {
     await client.query('ROLLBACK');
     console.error(err);
