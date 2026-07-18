@@ -103,13 +103,12 @@ async function getProgramDetail(programId) {
   const typologyIds = typologiesResult.rows.map((t) => t.id);
 
   const configsResult = typologyIds.length
-    ? await pool.query(`
-        SELECT explosive_program_configs.*, explosive_types.descripcion AS explosive_type_descripcion
-        FROM explosive_program_configs
-        JOIN explosive_types ON explosive_types.id = explosive_program_configs.explosive_type_id
-        WHERE typology_id = ANY($1::int[]) ORDER BY orden
-      `, [typologyIds])
+    ? await pool.query('SELECT * FROM explosive_program_configs WHERE typology_id = ANY($1::int[]) ORDER BY orden', [typologyIds])
     : { rows: [] };
+
+  const typesResult = await pool.query('SELECT id, descripcion FROM explosive_types');
+  const typeDescById = {};
+  typesResult.rows.forEach((t) => { typeDescById[t.id] = t.descripcion; });
 
   const wells = wellsResult.rows.map((w) => ({
     ...w,
@@ -118,21 +117,34 @@ async function getProgramDetail(programId) {
       .map((t) => ({ ...t, configs: configsResult.rows.filter((c) => c.typology_id === t.id) }))
   }));
 
-  // Consumo total por tipo de explosivo en todo el programa:
-  // por cada config, (cantidad_clusters * cargas_por_cluster) * cantidad_etapas del Pozo al que pertenece,
-  // sumado agrupando por tipo de explosivo.
+  // Consumo total por tipo de explosivo en todo el programa. Dos fuentes por etapa:
+  // 1) El Tapon (si tiene_tapon): 1 detonador primario + 1 secundario + 1 carga de poder,
+  //    una sola vez por etapa (no depende de la cantidad de clusters).
+  // 2) Cada Configuracion de cluster: (cargas_por_cluster) cargas + 1 detonador + cordon
+  //    detonante, todo multiplicado por cantidad_clusters de esa config.
+  // Todo eso, a su vez, multiplicado por cantidad_etapas del Pozo.
   const consumoPorTipo = {};
+  function sumar(typeId, cantidad) {
+    if (!typeId || !cantidad) return;
+    if (!consumoPorTipo[typeId]) {
+      consumoPorTipo[typeId] = { explosive_type_id: typeId, descripcion: typeDescById[typeId] || '?', cantidad: 0 };
+    }
+    consumoPorTipo[typeId].cantidad += cantidad;
+  }
+
   for (const well of wells) {
     const etapas = well.cantidad_etapas || 0;
     for (const typology of well.typologies) {
+      if (typology.tiene_tapon) {
+        sumar(typology.tapon_detonador_primario_id, 1 * etapas);
+        sumar(typology.tapon_detonador_secundario_id, 1 * etapas);
+        sumar(typology.tapon_carga_poder_id, 1 * etapas);
+      }
       for (const config of typology.configs) {
-        const cantidadPorEtapa = (config.cantidad_clusters || 0) * (config.cargas_por_cluster || 0);
-        const total = cantidadPorEtapa * etapas;
-        const key = config.explosive_type_id;
-        if (!consumoPorTipo[key]) {
-          consumoPorTipo[key] = { explosive_type_id: key, descripcion: config.explosive_type_descripcion, cantidad: 0 };
-        }
-        consumoPorTipo[key].cantidad += total;
+        const clusters = config.cantidad_clusters || 0;
+        sumar(config.explosive_type_id, clusters * (config.cargas_por_cluster || 0) * etapas);
+        sumar(config.detonador_type_id, clusters * 1 * etapas);
+        sumar(config.cordon_type_id, clusters * (config.cordon_cantidad_por_cluster || 0) * etapas);
       }
     }
   }
@@ -158,9 +170,18 @@ async function insertWells(client, programId, wells) {
 
     let typologyOrden = 0;
     for (const typology of (well.typologies || [])) {
+      const tieneTapon = typology.tiene_tapon !== false; // default true
       const typologyResult = await client.query(
-        'INSERT INTO explosive_program_typologies (program_well_id, nombre, orden) VALUES ($1,$2,$3) RETURNING id',
-        [wellId, typology.nombre || null, typologyOrden++]
+        `INSERT INTO explosive_program_typologies
+          (program_well_id, nombre, tiene_tapon, tapon_detonador_primario_id, tapon_detonador_secundario_id, tapon_carga_poder_id, orden)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+        [
+          wellId, typology.nombre || null, tieneTapon,
+          tieneTapon ? (typology.tapon_detonador_primario_id || null) : null,
+          tieneTapon ? (typology.tapon_detonador_secundario_id || null) : null,
+          tieneTapon ? (typology.tapon_carga_poder_id || null) : null,
+          typologyOrden++
+        ]
       );
       const typologyId = typologyResult.rows[0].id;
 
@@ -170,12 +191,13 @@ async function insertWells(client, programId, wells) {
         await client.query(
           `INSERT INTO explosive_program_configs
             (typology_id, explosive_type_id, diametro_canon, cantidad_clusters, largo_cluster_ft,
-             spf, fase, cargas_por_cluster, tpn, orden)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+             spf, fase, cargas_por_cluster, detonador_type_id, cordon_type_id, cordon_cantidad_por_cluster, tpn, orden)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
           [
             typologyId, config.explosive_type_id, config.diametro_canon || null,
             config.cantidad_clusters || null, config.largo_cluster_ft || null, config.spf || null,
             config.fase || null, config.cargas_por_cluster || null,
+            config.detonador_type_id || null, config.cordon_type_id || null, config.cordon_cantidad_por_cluster || null,
             config.tpn === 'N' ? 'N' : 'Y', configOrden++
           ]
         );
