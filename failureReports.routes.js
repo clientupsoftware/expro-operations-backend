@@ -19,6 +19,18 @@ router.get('/by-line/:lineId', requireAuth, async (req, res) => {
   res.json(result.rows);
 });
 
+// GET /api/failure-reports/by-stage/:stageId - lo mismo que by-line, pero para una etapa
+// de Bundle P&P en vez de una linea de On Call.
+router.get('/by-stage/:stageId', requireAuth, async (req, res) => {
+  const result = await pool.query(
+    `SELECT id, event_datetime, npt, clasificacion_nivel, estado
+     FROM failure_reports WHERE bundle_stage_id = $1
+     ORDER BY created_at DESC`,
+    [req.params.stageId]
+  );
+  res.json(result.rows);
+});
+
 // GET /api/failure-reports/notify-emails - lista de emails que reciben aviso al crear un reporte
 // (declarada antes de /:id a proposito: si no, /:id la intercepta interpretando "notify-emails" como un id)
 router.get('/notify-emails', requireAuth, async (req, res) => {
@@ -62,15 +74,15 @@ router.get('/:id', requireAuth, async (req, res) => {
   res.json({ ...report.rows[0], assets: assets.rows, photos: photos.rows });
 });
 
-// POST /api/failure-reports  -> crear, precargando campos verdes desde el job/linea
+// POST /api/failure-reports  -> crear, precargando campos verdes desde el job/linea (o etapa)
 router.post('/', requireAuth, async (req, res) => {
   const {
-    job_id, time_report_line_id, event_datetime,
+    job_id, time_report_line_id, bundle_stage_id, event_datetime,
     supervisor_id, cliente_id, pozo_etapa,
     npt, descripcion_que_sucedio, descripcion_por_que, acciones_inmediatas,
     clasificacion_nivel, causa_raiz, accion_correctiva,
     responsable_seguimiento_id, fecha_cierre,
-    asset_ids // ya viene filtrado en frontend al subset de assets de esa linea
+    asset_ids // ya viene filtrado en frontend al subset de assets de esa linea/etapa
   } = req.body;
 
   const client = await pool.connect();
@@ -79,27 +91,37 @@ router.post('/', requireAuth, async (req, res) => {
 
     const insertReport = await client.query(
       `INSERT INTO failure_reports
-       (job_id, time_report_line_id, event_datetime, supervisor_id, cliente_id, pozo_etapa,
+       (job_id, time_report_line_id, bundle_stage_id, event_datetime, supervisor_id, cliente_id, pozo_etapa,
         npt, descripcion_que_sucedio, descripcion_por_que, acciones_inmediatas,
         clasificacion_nivel, causa_raiz, accion_correctiva, responsable_seguimiento_id,
         fecha_cierre, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
        RETURNING id`,
-      [job_id, time_report_line_id, event_datetime, supervisor_id, cliente_id, pozo_etapa,
+      [job_id, time_report_line_id || null, bundle_stage_id || null, event_datetime, supervisor_id, cliente_id, pozo_etapa,
        npt, descripcion_que_sucedio, descripcion_por_que, acciones_inmediatas,
        clasificacion_nivel, causa_raiz, accion_correctiva, responsable_seguimiento_id,
        fecha_cierre, req.user.id]
     );
     const reportId = insertReport.rows[0].id;
 
-    // Assets fallados: acotados al subset de assets ya usados en esa linea del reporte de tiempos.
+    // Assets fallados: acotados al subset de assets ya usados en esa linea o etapa.
     if (asset_ids?.length) {
-      const validAssets = await client.query(
-        `SELECT asset_id FROM time_report_line_assets
-         WHERE time_report_line_id = $1 AND asset_id = ANY($2::int[])`,
-        [time_report_line_id, asset_ids]
-      );
-      const validIds = validAssets.rows.map(r => r.asset_id);
+      let validIds = [];
+      if (time_report_line_id) {
+        const validAssets = await client.query(
+          `SELECT asset_id FROM time_report_line_assets
+           WHERE time_report_line_id = $1 AND asset_id = ANY($2::int[])`,
+          [time_report_line_id, asset_ids]
+        );
+        validIds = validAssets.rows.map(r => r.asset_id);
+      } else if (bundle_stage_id) {
+        const validAssets = await client.query(
+          `SELECT asset_id FROM bundle_stage_assets
+           WHERE bundle_stage_id = $1 AND asset_id = ANY($2::int[])`,
+          [bundle_stage_id, asset_ids]
+        );
+        validIds = validAssets.rows.map(r => r.asset_id);
+      }
       for (const assetId of validIds) {
         await client.query(
           'INSERT INTO failure_report_assets (failure_report_id, asset_id) VALUES ($1, $2)',
@@ -174,19 +196,29 @@ router.patch('/:id', requireAuth, async (req, res) => {
     }
 
     if (hasAssetIds) {
-      const reportResult = await client.query('SELECT time_report_line_id FROM failure_reports WHERE id = $1', [id]);
+      const reportResult = await client.query('SELECT time_report_line_id, bundle_stage_id FROM failure_reports WHERE id = $1', [id]);
       if (reportResult.rows.length === 0) {
         await client.query('ROLLBACK');
         return res.status(404).json({ error: 'Reporte no encontrado.' });
       }
-      const lineId = reportResult.rows[0].time_report_line_id;
+      const { time_report_line_id: lineId, bundle_stage_id: stageId } = reportResult.rows[0];
 
       await client.query('DELETE FROM failure_report_assets WHERE failure_report_id = $1', [id]);
 
-      const validAssets = await client.query(
-        `SELECT asset_id FROM time_report_line_assets WHERE time_report_line_id = $1 AND asset_id = ANY($2::int[])`,
-        [lineId, fields.asset_ids]
-      );
+      let validAssets;
+      if (lineId) {
+        validAssets = await client.query(
+          `SELECT asset_id FROM time_report_line_assets WHERE time_report_line_id = $1 AND asset_id = ANY($2::int[])`,
+          [lineId, fields.asset_ids]
+        );
+      } else if (stageId) {
+        validAssets = await client.query(
+          `SELECT asset_id FROM bundle_stage_assets WHERE bundle_stage_id = $1 AND asset_id = ANY($2::int[])`,
+          [stageId, fields.asset_ids]
+        );
+      } else {
+        validAssets = { rows: [] };
+      }
       for (const row of validAssets.rows) {
         await client.query(
           'INSERT INTO failure_report_assets (failure_report_id, asset_id) VALUES ($1, $2)',

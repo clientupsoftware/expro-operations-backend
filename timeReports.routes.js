@@ -62,7 +62,6 @@ router.post('/:jobId', requireRole('coordinador', 'ingeniero'), async (req, res)
 });
 
 // DELETE /api/time-reports/:id - solo si el reporte todavia esta vacio (sin lineas ni stages cargadas).
-// Es lo que permite al ingeniero "volver atras" y elegir el otro formato antes de empezar a cargar datos.
 router.delete('/:id', requireRole('coordinador', 'ingeniero'), async (req, res) => {
   const { id } = req.params;
   const linesCount = await pool.query('SELECT COUNT(*) FROM time_report_lines WHERE time_report_id = $1', [id]);
@@ -77,7 +76,6 @@ router.delete('/:id', requireRole('coordinador', 'ingeniero'), async (req, res) 
 
 // ================= ON CALL =================
 
-// GET /api/time-reports/on-call/:reportId/lines
 router.get('/on-call/:reportId/lines', async (req, res) => {
   const linesResult = await pool.query(
     'SELECT * FROM time_report_lines WHERE time_report_id = $1 ORDER BY id',
@@ -97,9 +95,6 @@ router.get('/on-call/:reportId/lines', async (req, res) => {
   res.json(lines);
 });
 
-// GET /api/time-reports/on-call/:reportId/lines/prefill
-// Devuelve los assets de la ULTIMA linea cargada, para que el frontend pre-cargue el form
-// de la nueva linea (comportamiento pedido: "arrastrar" truck/set de presion entre corridas).
 router.get('/on-call/:reportId/lines/prefill', async (req, res) => {
   const lastLine = await pool.query(
     'SELECT id, fecha, desde, hasta FROM time_report_lines WHERE time_report_id = $1 ORDER BY id DESC LIMIT 1',
@@ -108,8 +103,6 @@ router.get('/on-call/:reportId/lines/prefill', async (req, res) => {
   if (lastLine.rows.length === 0) return res.json({ assets: [], ultima_hasta: null, fecha_sugerida: null });
 
   const last = lastLine.rows[0];
-
-  // Si "hasta" es menor que "desde", la linea cruzo la medianoche -> la fecha sugerida es al dia siguiente
   let fechaSugerida = last.fecha;
   if (last.desde && last.hasta && last.hasta < last.desde) {
     const next = new Date(last.fecha);
@@ -128,10 +121,6 @@ router.get('/on-call/:reportId/lines/prefill', async (req, res) => {
   res.json({ assets: assetsResult.rows, ultima_hasta: last.hasta, fecha_sugerida: fechaSugerida });
 });
 
-// POST /api/time-reports/on-call/:reportId/lines
-// body: { fecha, desde, hasta, actividad, operacion, evento_misrun, profundidad_desde,
-//         profundidad_hasta, comentarios, is_run, asset_ids: [{asset_id, string_label}] }
-// Si "asset_ids" no viene en el body, se pre-cargan automaticamente los de la ultima linea.
 router.post('/on-call/:reportId/lines', requireRole('coordinador', 'ingeniero'), async (req, res) => {
   const { reportId } = req.params;
   const {
@@ -144,7 +133,6 @@ router.post('/on-call/:reportId/lines', requireRole('coordinador', 'ingeniero'),
   try {
     await client.query('BEGIN');
 
-    // Pre-carga automatica de la linea anterior si no se especificaron assets
     if (asset_ids === undefined) {
       const lastLine = await client.query(
         'SELECT id FROM time_report_lines WHERE time_report_id = $1 ORDER BY id DESC LIMIT 1',
@@ -179,7 +167,6 @@ router.post('/on-call/:reportId/lines', requireRole('coordinador', 'ingeniero'),
       );
     }
 
-    // Si la linea representa una carrera completa, sumamos 1 a cada asset involucrado
     if (is_run && asset_ids.length > 0) {
       const jobResult = await client.query('SELECT job_id FROM time_reports WHERE id = $1', [reportId]);
       await registerRuns(client, asset_ids.map((a) => a.asset_id), jobResult.rows[0].job_id, 'on_call_line');
@@ -196,7 +183,6 @@ router.post('/on-call/:reportId/lines', requireRole('coordinador', 'ingeniero'),
   }
 });
 
-// PATCH /api/time-reports/on-call/lines/:lineId - editar una linea existente
 router.patch('/on-call/lines/:lineId', requireRole('coordinador', 'ingeniero'), async (req, res) => {
   const { lineId } = req.params;
   const {
@@ -229,7 +215,6 @@ router.patch('/on-call/lines/:lineId', requireRole('coordinador', 'ingeniero'), 
     const newAssetIds = Array.isArray(asset_ids) ? asset_ids.map((a) => a.asset_id) : oldAssetIds;
     const newIsRun = is_run !== undefined ? is_run : oldLine.is_run;
 
-    // Ajustar contador de carreras segun lo que cambio
     const oldCounted = oldLine.is_run ? oldAssetIds : [];
     const newCounted = newIsRun ? newAssetIds : [];
     const toRemove = oldCounted.filter((id) => !newCounted.includes(id));
@@ -269,7 +254,6 @@ router.patch('/on-call/lines/:lineId', requireRole('coordinador', 'ingeniero'), 
   }
 });
 
-// DELETE /api/time-reports/on-call/lines/:lineId
 router.delete('/on-call/lines/:lineId', requireRole('coordinador', 'ingeniero'), async (req, res) => {
   const { lineId } = req.params;
 
@@ -299,7 +283,7 @@ router.delete('/on-call/lines/:lineId', requireRole('coordinador', 'ingeniero'),
       if (assetIds.length > 0) await unregisterRuns(client, assetIds, line.job_id, 'on_call_line');
     }
 
-    await client.query('DELETE FROM time_report_lines WHERE id = $1', [lineId]); // cascade borra los assets de la linea
+    await client.query('DELETE FROM time_report_lines WHERE id = $1', [lineId]);
 
     await client.query('COMMIT');
     res.status(204).send();
@@ -314,7 +298,6 @@ router.delete('/on-call/lines/:lineId', requireRole('coordinador', 'ingeniero'),
 
 // ================= BUNDLE P&P =================
 
-// GET /api/time-reports/bundle/:reportId/stages
 router.get('/bundle/:reportId/stages', async (req, res) => {
   const stagesResult = await pool.query(
     'SELECT * FROM bundle_stages WHERE time_report_id = $1 ORDER BY stage_number',
@@ -339,7 +322,7 @@ router.get('/bundle/:reportId/stages', async (req, res) => {
 router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'), async (req, res) => {
   const { reportId } = req.params;
   const body = req.body;
-  const { asset_ids } = body; // [{asset_id, string_label}]
+  const { asset_ids } = body;
 
   const client = await pool.connect();
   try {
@@ -353,19 +336,17 @@ router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'),
 
     const stageResult = await client.query(
       `INSERT INTO bundle_stages (
-         time_report_id, well_id, stage_number, fecha, plug_type, plug_size, gun_od,
-         charge_type, spf, charge_qty, gun_qty, engineer, crew_leader,
-         crew_member_2, crew_member_3, crew_member_4,
+         time_report_id, well_id, stage_number, fecha, plug_type,
+         engineer_id, crew_leader_id, crew_member_2_id, crew_member_3_id, crew_member_4_id,
          time_well_to_wl, time_rih, time_start_pump_down, time_poo,
          time_bha_in_lubricator, time_well_return, well_pressure,
          plug_problem, hse_issue, misfire, comentarios, created_by
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
        RETURNING *`,
       [reportId, body.well_id || null, nextStageNumber, body.fecha || null,
-       body.plug_type || null, body.plug_size || null, body.gun_od || null,
-       body.charge_type || null, body.spf || null, body.charge_qty || null, body.gun_qty || null,
-       body.engineer || null, body.crew_leader || null,
-       body.crew_member_2 || null, body.crew_member_3 || null, body.crew_member_4 || null,
+       body.plug_type || null,
+       body.engineer_id || null, body.crew_leader_id || null,
+       body.crew_member_2_id || null, body.crew_member_3_id || null, body.crew_member_4_id || null,
        body.time_well_to_wl || null, body.time_rih || null, body.time_start_pump_down || null,
        body.time_poo || null, body.time_bha_in_lubricator || null, body.time_well_return || null,
        body.well_pressure || null, body.plug_problem || false, body.hse_issue || false,
@@ -397,6 +378,124 @@ router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'),
   }
 });
 
+// PATCH /api/time-reports/bundle/stages/:stageId - editar una etapa existente
+// (nuevo: antes solo se podia crear, no editar - necesario para poder marcar
+// "hubo evento" despues de creada la etapa, igual que en On Call).
+router.patch('/bundle/stages/:stageId', requireRole('coordinador', 'ingeniero'), async (req, res) => {
+  const { stageId } = req.params;
+  const body = req.body;
+  const { asset_ids } = body;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const existing = await client.query(
+      `SELECT bundle_stages.*, time_reports.job_id
+       FROM bundle_stages
+       JOIN time_reports ON time_reports.id = bundle_stages.time_report_id
+       WHERE bundle_stages.id = $1`,
+      [stageId]
+    );
+    if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Etapa no encontrada.' });
+    }
+    const oldStage = existing.rows[0];
+
+    const oldAssetsResult = await client.query(
+      'SELECT asset_id FROM bundle_stage_assets WHERE bundle_stage_id = $1',
+      [stageId]
+    );
+    const oldAssetIds = oldAssetsResult.rows.map((r) => r.asset_id);
+    const newAssetIds = Array.isArray(asset_ids) ? asset_ids.map((a) => a.asset_id) : oldAssetIds;
+
+    const toRemove = oldAssetIds.filter((id) => !newAssetIds.includes(id));
+    const toAdd = newAssetIds.filter((id) => !oldAssetIds.includes(id));
+    if (toRemove.length > 0) await unregisterRuns(client, toRemove, oldStage.job_id, 'bundle_stage');
+    if (toAdd.length > 0) await registerRuns(client, toAdd, oldStage.job_id, 'bundle_stage');
+
+    const updated = await client.query(
+      `UPDATE bundle_stages SET
+         well_id = $1, fecha = $2, plug_type = $3,
+         engineer_id = $4, crew_leader_id = $5, crew_member_2_id = $6, crew_member_3_id = $7, crew_member_4_id = $8,
+         time_well_to_wl = $9, time_rih = $10, time_start_pump_down = $11, time_poo = $12,
+         time_bha_in_lubricator = $13, time_well_return = $14, well_pressure = $15,
+         plug_problem = $16, hse_issue = $17, misfire = $18, comentarios = $19
+       WHERE id = $20 RETURNING *`,
+      [
+        body.well_id || null, body.fecha || null, body.plug_type || null,
+        body.engineer_id || null, body.crew_leader_id || null,
+        body.crew_member_2_id || null, body.crew_member_3_id || null, body.crew_member_4_id || null,
+        body.time_well_to_wl || null, body.time_rih || null, body.time_start_pump_down || null,
+        body.time_poo || null, body.time_bha_in_lubricator || null, body.time_well_return || null,
+        body.well_pressure || null, body.plug_problem || false, body.hse_issue || false,
+        body.misfire || false, body.comentarios || null, stageId
+      ]
+    );
+
+    if (Array.isArray(asset_ids)) {
+      await client.query('DELETE FROM bundle_stage_assets WHERE bundle_stage_id = $1', [stageId]);
+      for (const item of asset_ids) {
+        await client.query(
+          'INSERT INTO bundle_stage_assets (bundle_stage_id, asset_id, string_label) VALUES ($1, $2, $3)',
+          [stageId, item.asset_id, item.string_label || null]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json({ ...updated.rows[0], assets: newAssetIds.map((id) => ({ asset_id: id })) });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al editar la etapa.' });
+  } finally {
+    client.release();
+  }
+});
+
+// DELETE /api/time-reports/bundle/stages/:stageId
+router.delete('/bundle/stages/:stageId', requireRole('coordinador', 'ingeniero'), async (req, res) => {
+  const { stageId } = req.params;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const existing = await client.query(
+      `SELECT bundle_stages.*, time_reports.job_id
+       FROM bundle_stages
+       JOIN time_reports ON time_reports.id = bundle_stages.time_report_id
+       WHERE bundle_stages.id = $1`,
+      [stageId]
+    );
+    if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Etapa no encontrada.' });
+    }
+    const stage = existing.rows[0];
+
+    const assetsResult = await client.query(
+      'SELECT asset_id FROM bundle_stage_assets WHERE bundle_stage_id = $1',
+      [stageId]
+    );
+    const assetIds = assetsResult.rows.map((r) => r.asset_id);
+    if (assetIds.length > 0) await unregisterRuns(client, assetIds, stage.job_id, 'bundle_stage');
+
+    await client.query('DELETE FROM bundle_stages WHERE id = $1', [stageId]);
+
+    await client.query('COMMIT');
+    res.status(204).send();
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al eliminar la etapa.' });
+  } finally {
+    client.release();
+  }
+});
+
 // ================= ENCABEZADO (para que la exportacion a Excel salga completa) =================
 
 const HEADER_FIELDS = [
@@ -408,7 +507,6 @@ const HEADER_FIELDS = [
   'numero_wls', 'power_pack', 'wire_type_size', 'consumables_used'
 ];
 
-// PATCH /api/time-reports/:reportId/header - guarda los datos de encabezado (opcionales)
 router.patch('/:reportId/header', requireRole('coordinador', 'ingeniero'), async (req, res) => {
   const setClauses = [];
   const values = [];
@@ -436,7 +534,7 @@ function toHoursDecimal(desde, hasta) {
   const [h1, m1] = desde.split(':').map(Number);
   const [h2, m2] = hasta.split(':').map(Number);
   let minutes = (h2 * 60 + m2) - (h1 * 60 + m1);
-  if (minutes < 0) minutes += 24 * 60; // cruza medianoche
+  if (minutes < 0) minutes += 24 * 60;
   return Math.round((minutes / 60) * 100) / 100;
 }
 
@@ -448,8 +546,6 @@ function computeIntervalo(desde, hasta) {
   return 0;
 }
 
-// GET /api/time-reports/on-call/:reportId/export - descarga el .xlsx con el formato real de Expro
-// Usa template_on_call.xlsx (tu plantilla real) como base y solo completa los datos.
 router.get('/on-call/:reportId/export', async (req, res) => {
   const ExcelJS = require('exceljs');
   const { reportId } = req.params;
@@ -475,7 +571,6 @@ router.get('/on-call/:reportId/export', async (req, res) => {
   const jobHeaderResult = await pool.query('SELECT * FROM jobs WHERE id = $1', [report.job_id]);
   const jobHeader = jobHeaderResult.rows[0] || {};
 
-  // El reporte puede pisar el dato del Job (si el ingeniero lo edito ahi); si no, se usa el default del Job.
   function val(field) {
     const reportValue = report[field];
     if (reportValue !== null && reportValue !== undefined && reportValue !== '') return reportValue;
@@ -522,10 +617,6 @@ router.get('/on-call/:reportId/export', async (req, res) => {
   set('B18', `JOB SUMMARY: ${val('job_objective') || report.service_name || ''}`);
   set('B19', `Unidad Liviana: ${val('unidad_liviana') || '-'}      Unidad de carga: ${val('unidad_carga') || '-'}      Unidad de WL: ${val('unidad_wl') || '-'}`);
 
-  // La tabla de lineas ocupa las filas 23 a 46 en la plantilla (24 lineas).
-  // Si el reporte tiene mas lineas, se duplican filas con el mismo estilo antes del pie,
-  // para no pisar la parte de firmas/consumibles. Esto corre el pie hacia abajo, por eso
-  // las celdas del pie se calculan con el offset "extraRows".
   const TABLE_FIRST_ROW = 23;
   const TABLE_LAST_ROW = 46;
   const availableRows = TABLE_LAST_ROW - TABLE_FIRST_ROW + 1;
@@ -541,23 +632,23 @@ router.get('/on-call/:reportId/export', async (req, res) => {
     const fechaStr = line.fecha ? new Date(line.fecha).toISOString().slice(0, 10) : null;
     const row = sheet.getRow(rowIndex);
     if (fechaStr !== lastFecha) {
-      row.getCell(2).value = line.fecha; // B
+      row.getCell(2).value = line.fecha;
       lastFecha = fechaStr;
     }
-    row.getCell(3).value = line.desde;  // C
-    row.getCell(4).value = line.hasta;  // D
-    row.getCell(5).value = toHoursDecimal(line.desde, line.hasta); // E
-    row.getCell(8).value = line.comentarios || [line.operacion, line.actividad].filter(Boolean).join(' - '); // H
+    row.getCell(3).value = line.desde;
+    row.getCell(4).value = line.hasta;
+    row.getCell(5).value = toHoursDecimal(line.desde, line.hasta);
+    row.getCell(8).value = line.comentarios || [line.operacion, line.actividad].filter(Boolean).join(' - ');
     if (line.profundidad_desde !== null || line.profundidad_hasta !== null) {
       const desdeTxt = line.profundidad_desde !== null ? `DESDE ${line.profundidad_desde} m` : '';
       const hastaTxt = line.profundidad_hasta !== null ? `HASTA ${line.profundidad_hasta} m` : '';
-      row.getCell(14).value = [desdeTxt, hastaTxt].filter(Boolean).join(' '); // N
+      row.getCell(14).value = [desdeTxt, hastaTxt].filter(Boolean).join(' ');
     }
     rowIndex += 1;
   }
 
   set(`E${52 + extraRows}`, val('wire_type_size'));
-  set(`K${50 + extraRows}`, misrunCount); // Mis-runs
+  set(`K${50 + extraRows}`, misrunCount);
   set(`E${60 + extraRows}`, val('consumables_used'));
   set(`E${64 + extraRows}`, val('representante_cliente'));
   set(`L${64 + extraRows}`, val('expro_representante'));
