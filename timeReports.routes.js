@@ -296,6 +296,47 @@ router.delete('/on-call/lines/:lineId', requireRole('coordinador', 'ingeniero'),
   }
 });
 
+// Valida que la etapa elegida para este Pozo sea correcta: si ya hay una etapa efectiva
+// igual o mayor cargada para ese mismo pozo (dentro de este reporte), hace falta que venga
+// confirmado como "repunzado" - si no, se rechaza. Etapas marcadas NO efectivas no bloquean
+// nada (no cuentan como "completadas" de verdad).
+async function validarSecuenciaEtapa(client, { timeReportId, wellId, etapa, esRepunzado, excludeStageId }) {
+  if (!wellId || etapa === undefined || etapa === null) return;
+
+  const params = [timeReportId, wellId];
+  let query = `SELECT MAX(etapa) AS max_etapa FROM bundle_stages
+               WHERE time_report_id = $1 AND well_id = $2 AND etapa_efectiva = true`;
+  if (excludeStageId) {
+    params.push(excludeStageId);
+    query += ` AND id != $${params.length}`;
+  }
+  const result = await client.query(query, params);
+  const maxEtapa = result.rows[0].max_etapa;
+
+  if (maxEtapa !== null && etapa <= maxEtapa && !esRepunzado) {
+    const err = new Error(
+      `La etapa ${etapa} de este pozo ya fue completada (ultima etapa efectiva: ${maxEtapa}). ` +
+      `Si necesitas repetirla, confirma la opcion "Repunzado".`
+    );
+    err.isSequenceError = true;
+    throw err;
+  }
+}
+
+// Reemplaza (delete + insert) el detalle de disparo por Configuracion de una Stage.
+async function setStageConfigResults(client, stageId, configResults) {
+  await client.query('DELETE FROM bundle_stage_config_results WHERE bundle_stage_id = $1', [stageId]);
+  let orden = 0;
+  for (const cr of (configResults || [])) {
+    if (!cr.typology_config_id) continue;
+    await client.query(
+      `INSERT INTO bundle_stage_config_results (bundle_stage_id, typology_config_id, guns_planned, guns_fired, orden)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [stageId, cr.typology_config_id, cr.guns_planned || 0, cr.guns_fired ?? cr.guns_planned ?? 0, orden++]
+    );
+  }
+}
+
 // ================= BUNDLE P&P =================
 
 router.get('/bundle/:reportId/stages', async (req, res) => {
@@ -309,10 +350,19 @@ router.get('/bundle/:reportId/stages', async (req, res) => {
     JOIN assets ON assets.id = bundle_stage_assets.asset_id
     WHERE bundle_stage_id = ANY($1::int[])
   `, [stagesResult.rows.map((s) => s.id)]);
+  const configResultsResult = await pool.query(`
+    SELECT bundle_stage_config_results.*, explosive_types.descripcion AS charge_type_descripcion
+    FROM bundle_stage_config_results
+    JOIN explosive_typology_configs ON explosive_typology_configs.id = bundle_stage_config_results.typology_config_id
+    JOIN explosive_types ON explosive_types.id = explosive_typology_configs.charge_type_id
+    WHERE bundle_stage_id = ANY($1::int[])
+    ORDER BY orden
+  `, [stagesResult.rows.map((s) => s.id)]);
 
   const stages = stagesResult.rows.map((stage) => ({
     ...stage,
-    assets: assetsResult.rows.filter((a) => a.bundle_stage_id === stage.id)
+    assets: assetsResult.rows.filter((a) => a.bundle_stage_id === stage.id),
+    config_results: configResultsResult.rows.filter((c) => c.bundle_stage_id === stage.id)
   }));
   res.json(stages);
 });
@@ -322,11 +372,15 @@ router.get('/bundle/:reportId/stages', async (req, res) => {
 router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'), async (req, res) => {
   const { reportId } = req.params;
   const body = req.body;
-  const { asset_ids } = body;
+  const { asset_ids, config_results } = body;
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    await validarSecuenciaEtapa(client, {
+      timeReportId: reportId, wellId: body.well_id, etapa: body.etapa, esRepunzado: body.es_repunzado
+    });
 
     const lastStage = await client.query(
       'SELECT COALESCE(MAX(stage_number), 0) AS max_stage FROM bundle_stages WHERE time_report_id = $1',
@@ -336,15 +390,18 @@ router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'),
 
     const stageResult = await client.query(
       `INSERT INTO bundle_stages (
-         time_report_id, well_id, stage_number, fecha, plug_type,
+         time_report_id, well_id, stage_number, etapa, etapa_efectiva, es_repunzado,
+         typology_id, tapon_fired, fecha, plug_type,
          engineer_id, crew_leader_id, crew_member_2_id, crew_member_3_id, crew_member_4_id,
          time_well_to_wl, time_rih, time_start_pump_down, time_poo,
          time_bha_in_lubricator, time_well_return, well_pressure,
          plug_problem, hse_issue, misfire, comentarios, created_by
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
        RETURNING *`,
-      [reportId, body.well_id || null, nextStageNumber, body.fecha || null,
-       body.plug_type || null,
+      [reportId, body.well_id || null, nextStageNumber, body.etapa || null,
+       body.etapa_efectiva !== false, body.es_repunzado || false,
+       body.typology_id || null, body.tapon_fired === undefined ? null : body.tapon_fired,
+       body.fecha || null, body.plug_type || null,
        body.engineer_id || null, body.crew_leader_id || null,
        body.crew_member_2_id || null, body.crew_member_3_id || null, body.crew_member_4_id || null,
        body.time_well_to_wl || null, body.time_rih || null, body.time_start_pump_down || null,
@@ -353,6 +410,8 @@ router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'),
        body.misfire || false, body.comentarios || null, req.user.id]
     );
     const stage = stageResult.rows[0];
+
+    await setStageConfigResults(client, stage.id, config_results);
 
     const assetsToLink = asset_ids || [];
     for (const item of assetsToLink) {
@@ -368,9 +427,10 @@ router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'),
     }
 
     await client.query('COMMIT');
-    res.status(201).json({ ...stage, assets: assetsToLink });
+    res.status(201).json({ ...stage, assets: assetsToLink, config_results: config_results || [] });
   } catch (err) {
     await client.query('ROLLBACK');
+    if (err.isSequenceError) return res.status(409).json({ error: err.message });
     console.error(err);
     res.status(500).json({ error: 'Error al crear la stage.' });
   } finally {
@@ -384,7 +444,7 @@ router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'),
 router.patch('/bundle/stages/:stageId', requireRole('coordinador', 'ingeniero'), async (req, res) => {
   const { stageId } = req.params;
   const body = req.body;
-  const { asset_ids } = body;
+  const { asset_ids, config_results } = body;
 
   const client = await pool.connect();
   try {
@@ -403,6 +463,11 @@ router.patch('/bundle/stages/:stageId', requireRole('coordinador', 'ingeniero'),
     }
     const oldStage = existing.rows[0];
 
+    await validarSecuenciaEtapa(client, {
+      timeReportId: oldStage.time_report_id, wellId: body.well_id, etapa: body.etapa,
+      esRepunzado: body.es_repunzado, excludeStageId: stageId
+    });
+
     const oldAssetsResult = await client.query(
       'SELECT asset_id FROM bundle_stage_assets WHERE bundle_stage_id = $1',
       [stageId]
@@ -417,14 +482,17 @@ router.patch('/bundle/stages/:stageId', requireRole('coordinador', 'ingeniero'),
 
     const updated = await client.query(
       `UPDATE bundle_stages SET
-         well_id = $1, fecha = $2, plug_type = $3,
-         engineer_id = $4, crew_leader_id = $5, crew_member_2_id = $6, crew_member_3_id = $7, crew_member_4_id = $8,
-         time_well_to_wl = $9, time_rih = $10, time_start_pump_down = $11, time_poo = $12,
-         time_bha_in_lubricator = $13, time_well_return = $14, well_pressure = $15,
-         plug_problem = $16, hse_issue = $17, misfire = $18, comentarios = $19
-       WHERE id = $20 RETURNING *`,
+         well_id = $1, etapa = $2, etapa_efectiva = $3, es_repunzado = $4,
+         typology_id = $5, tapon_fired = $6, fecha = $7, plug_type = $8,
+         engineer_id = $9, crew_leader_id = $10, crew_member_2_id = $11, crew_member_3_id = $12, crew_member_4_id = $13,
+         time_well_to_wl = $14, time_rih = $15, time_start_pump_down = $16, time_poo = $17,
+         time_bha_in_lubricator = $18, time_well_return = $19, well_pressure = $20,
+         plug_problem = $21, hse_issue = $22, misfire = $23, comentarios = $24
+       WHERE id = $25 RETURNING *`,
       [
-        body.well_id || null, body.fecha || null, body.plug_type || null,
+        body.well_id || null, body.etapa || null, body.etapa_efectiva !== false, body.es_repunzado || false,
+        body.typology_id || null, body.tapon_fired === undefined ? null : body.tapon_fired,
+        body.fecha || null, body.plug_type || null,
         body.engineer_id || null, body.crew_leader_id || null,
         body.crew_member_2_id || null, body.crew_member_3_id || null, body.crew_member_4_id || null,
         body.time_well_to_wl || null, body.time_rih || null, body.time_start_pump_down || null,
@@ -444,10 +512,15 @@ router.patch('/bundle/stages/:stageId', requireRole('coordinador', 'ingeniero'),
       }
     }
 
+    if (Array.isArray(config_results)) {
+      await setStageConfigResults(client, stageId, config_results);
+    }
+
     await client.query('COMMIT');
-    res.json({ ...updated.rows[0], assets: newAssetIds.map((id) => ({ asset_id: id })) });
+    res.json({ ...updated.rows[0], assets: newAssetIds.map((id) => ({ asset_id: id })), config_results: config_results || [] });
   } catch (err) {
     await client.query('ROLLBACK');
+    if (err.isSequenceError) return res.status(409).json({ error: err.message });
     console.error(err);
     res.status(500).json({ error: 'Error al editar la etapa.' });
   } finally {
