@@ -307,10 +307,11 @@ async function applyStageStockMovements(client, stage, configResultsInput) {
   if (!stage.typology_id) return; // sin tipologia elegida, no hay nada que descontar
 
   const padResult = await client.query(
-    `SELECT jobs.pad_id FROM time_reports JOIN jobs ON jobs.id = time_reports.job_id WHERE time_reports.id = $1`,
+    `SELECT jobs.pad_id, jobs.id AS job_id FROM time_reports JOIN jobs ON jobs.id = time_reports.job_id WHERE time_reports.id = $1`,
     [stage.time_report_id]
   );
   const padId = padResult.rows[0]?.pad_id;
+  const jobId = padResult.rows[0]?.job_id;
   if (!padId) return;
 
   const typologyResult = await client.query('SELECT * FROM explosive_typologies WHERE id = $1', [stage.typology_id]);
@@ -344,9 +345,9 @@ async function applyStageStockMovements(client, stage, configResultsInput) {
     if (cantidad <= 0) continue;
     await client.query(
       `INSERT INTO explosive_stock_movements
-        (pad_id, explosive_type_id, tipo_movimiento, cantidad, fecha, bundle_stage_id, detalle, created_by)
-       VALUES ($1,$2,'salida',$3,$4,$5,$6,$7)`,
-      [padId, explosiveTypeId, cantidad, stage.fecha || new Date(), stage.id,
+        (pad_id, explosive_type_id, tipo_movimiento, cantidad, fecha, bundle_stage_id, job_id, detalle, created_by)
+       VALUES ($1,$2,'salida',$3,$4,$5,$6,$7,$8)`,
+      [padId, explosiveTypeId, cantidad, stage.fecha || new Date(), stage.id, jobId,
        `Consumo real de la etapa ${stage.etapa || stage.stage_number}`, stage.created_by]
     );
   }

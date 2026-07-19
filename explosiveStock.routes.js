@@ -164,4 +164,22 @@ router.delete('/alert-rules/:id', requireRole('mantenimiento'), async (req, res)
   res.status(204).send();
 });
 
+// GET /api/explosive-stock/job/:jobId - todo lo ingresado y consumido de explosivos en este Job puntual
+router.get('/job/:jobId', async (req, res) => {
+  const result = await pool.query(`
+    SELECT explosive_stock_movements.*, explosive_types.descripcion AS explosive_type_descripcion,
+           bundle_stages.etapa AS stage_etapa, wells.name AS stage_well_name,
+           explosive_programs.nombre AS program_nombre
+    FROM explosive_stock_movements
+    JOIN explosive_types ON explosive_types.id = explosive_stock_movements.explosive_type_id
+    LEFT JOIN bundle_stages ON bundle_stages.id = explosive_stock_movements.bundle_stage_id
+    LEFT JOIN wells ON wells.id = bundle_stages.well_id
+    LEFT JOIN explosive_program_dispatches ON explosive_program_dispatches.id = explosive_stock_movements.dispatch_id
+    LEFT JOIN explosive_programs ON explosive_programs.id = explosive_program_dispatches.program_id
+    WHERE explosive_stock_movements.job_id = $1
+    ORDER BY explosive_stock_movements.fecha DESC, explosive_stock_movements.id DESC
+  `, [req.params.jobId]);
+  res.json(result.rows);
+});
+
 module.exports = router;

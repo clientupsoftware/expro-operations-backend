@@ -412,4 +412,97 @@ router.delete('/programs/:id', requireRole('mantenimiento'), async (req, res) =>
   res.status(204).send();
 });
 
+// POST /api/explosives/programs/:id/dispatch - despacha stock de este programa hacia un Job.
+// items: [{explosive_type_id, cantidad}] - la cantidad final a enviar (puede ser parcial,
+// total, o con ajuste manual respecto de lo que calcula el programa). El PAD de destino se
+// saca solo del Job elegido (siempre entra al PAD de ese Job).
+router.post('/programs/:id/dispatch', requireRole('mantenimiento'), async (req, res) => {
+  const { id: programId } = req.params;
+  const { job_id, items } = req.body;
+  if (!job_id || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'job_id e items (array, al menos 1) son requeridos.' });
+  }
+
+  const jobResult = await pool.query('SELECT pad_id FROM jobs WHERE id = $1', [job_id]);
+  if (jobResult.rows.length === 0) return res.status(404).json({ error: 'Job no encontrado.' });
+  const padId = jobResult.rows[0].pad_id;
+  if (!padId) return res.status(400).json({ error: 'Este Job no tiene un PAD asignado todavia.' });
+
+  const programDetail = await getProgramDetail(programId);
+  if (!programDetail) return res.status(404).json({ error: 'Programa no encontrado.' });
+  const programadoPorTipo = {};
+  programDetail.consumo_total.forEach((c) => { programadoPorTipo[c.explosive_type_id] = c.cantidad; });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const dispatchResult = await client.query(
+      `INSERT INTO explosive_program_dispatches (program_id, job_id, pad_id, created_by) VALUES ($1,$2,$3,$4) RETURNING id`,
+      [programId, job_id, padId, req.user.id]
+    );
+    const dispatchId = dispatchResult.rows[0].id;
+
+    let itemsCreados = 0;
+    for (const item of items) {
+      const cantidad = Number(item.cantidad);
+      if (!item.explosive_type_id || !cantidad || cantidad <= 0) continue;
+      const cantidadProgramada = programadoPorTipo[item.explosive_type_id] || 0;
+
+      await client.query(
+        `INSERT INTO explosive_program_dispatch_items (dispatch_id, explosive_type_id, cantidad_programada, cantidad)
+         VALUES ($1,$2,$3,$4)`,
+        [dispatchId, item.explosive_type_id, cantidadProgramada, cantidad]
+      );
+      await client.query(
+        `INSERT INTO explosive_stock_movements
+          (pad_id, explosive_type_id, tipo_movimiento, cantidad, fecha, job_id, dispatch_id, detalle, created_by)
+         VALUES ($1,$2,'entrada',$3,CURRENT_DATE,$4,$5,$6,$7)`,
+        [padId, item.explosive_type_id, cantidad, job_id, dispatchId,
+         `Despacho desde Programa "${programDetail.nombre || ('#' + programId)}"`, req.user.id]
+      );
+      itemsCreados += 1;
+    }
+
+    if (itemsCreados === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Ningun item tenia una cantidad valida mayor a 0.' });
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json({ id: dispatchId, items: itemsCreados });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al despachar el programa.' });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/explosives/programs/:id/dispatches - historial de despachos de este programa
+router.get('/programs/:id/dispatches', async (req, res) => {
+  const dispatchesResult = await pool.query(`
+    SELECT explosive_program_dispatches.*, jobs.job_number, pads.name AS pad_name
+    FROM explosive_program_dispatches
+    JOIN jobs ON jobs.id = explosive_program_dispatches.job_id
+    JOIN pads ON pads.id = explosive_program_dispatches.pad_id
+    WHERE program_id = $1 ORDER BY created_at DESC
+  `, [req.params.id]);
+  const dispatchIds = dispatchesResult.rows.map((d) => d.id);
+  const itemsResult = dispatchIds.length
+    ? await pool.query(`
+        SELECT explosive_program_dispatch_items.*, explosive_types.descripcion
+        FROM explosive_program_dispatch_items
+        JOIN explosive_types ON explosive_types.id = explosive_program_dispatch_items.explosive_type_id
+        WHERE dispatch_id = ANY($1::int[])
+      `, [dispatchIds])
+    : { rows: [] };
+
+  res.json(dispatchesResult.rows.map((d) => ({
+    ...d,
+    items: itemsResult.rows.filter((i) => i.dispatch_id === d.id)
+  })));
+});
+
 module.exports = router;
