@@ -18,14 +18,14 @@ router.get('/balance', async (req, res) => {
     SELECT
       explosive_types.id AS explosive_type_id,
       explosive_types.descripcion,
-      COALESCE(SUM(CASE WHEN tipo_movimiento = 'entrada' THEN cantidad ELSE 0 END), 0)
+      COALESCE(SUM(CASE WHEN tipo_movimiento IN ('entrada', 'devolucion') THEN cantidad ELSE 0 END), 0)
         - COALESCE(SUM(CASE WHEN tipo_movimiento = 'salida' THEN cantidad ELSE 0 END), 0) AS balance
     FROM explosive_types
     LEFT JOIN explosive_stock_movements
       ON explosive_stock_movements.explosive_type_id = explosive_types.id
       AND explosive_stock_movements.pad_id = $1
     GROUP BY explosive_types.id, explosive_types.descripcion
-    HAVING COALESCE(SUM(CASE WHEN tipo_movimiento = 'entrada' THEN cantidad ELSE 0 END), 0) > 0
+    HAVING COALESCE(SUM(CASE WHEN tipo_movimiento IN ('entrada', 'devolucion') THEN cantidad ELSE 0 END), 0) > 0
         OR COALESCE(SUM(CASE WHEN tipo_movimiento = 'salida' THEN cantidad ELSE 0 END), 0) > 0
     ORDER BY explosive_types.descripcion
   `, [pad_id]);
@@ -180,6 +180,46 @@ router.get('/job/:jobId', async (req, res) => {
     ORDER BY explosive_stock_movements.fecha DESC, explosive_stock_movements.id DESC
   `, [req.params.jobId]);
   res.json(result.rows);
+});
+
+// POST /api/explosive-stock/devolucion - sobrante que vuelve del pozo/Job hacia el PAD
+router.post('/devolucion', requireRole('mantenimiento'), async (req, res) => {
+  const { pad_id, job_id, explosive_type_id, cantidad, fecha, responsable_id, detalle } = req.body;
+  if (!pad_id || !explosive_type_id || !cantidad || cantidad <= 0) {
+    return res.status(400).json({ error: 'pad_id, explosive_type_id y cantidad (mayor a 0) son requeridos.' });
+  }
+  const result = await pool.query(
+    `INSERT INTO explosive_stock_movements
+      (pad_id, explosive_type_id, tipo_movimiento, cantidad, fecha, job_id, responsable_id, detalle, created_by)
+     VALUES ($1,$2,'devolucion',$3,COALESCE($4, CURRENT_DATE),$5,$6,$7,$8) RETURNING *`,
+    [pad_id, explosive_type_id, cantidad, fecha || null, job_id || null, responsable_id || null, detalle || null, req.user.id]
+  );
+  res.status(201).json(result.rows[0]);
+});
+
+// GET /api/explosive-stock/job/:jobId/pending-dispatches - despachos de este Job todavia no confirmados
+router.get('/job/:jobId/pending-dispatches', async (req, res) => {
+  const dispatchesResult = await pool.query(`
+    SELECT explosive_program_dispatches.*, explosive_programs.nombre AS program_nombre
+    FROM explosive_program_dispatches
+    JOIN explosive_programs ON explosive_programs.id = explosive_program_dispatches.program_id
+    WHERE explosive_program_dispatches.job_id = $1 AND explosive_program_dispatches.confirmado = false
+    ORDER BY explosive_program_dispatches.created_at DESC
+  `, [req.params.jobId]);
+  const dispatchIds = dispatchesResult.rows.map((d) => d.id);
+  const itemsResult = dispatchIds.length
+    ? await pool.query(`
+        SELECT explosive_program_dispatch_items.*, explosive_types.descripcion
+        FROM explosive_program_dispatch_items
+        JOIN explosive_types ON explosive_types.id = explosive_program_dispatch_items.explosive_type_id
+        WHERE dispatch_id = ANY($1::int[])
+      `, [dispatchIds])
+    : { rows: [] };
+
+  res.json(dispatchesResult.rows.map((d) => ({
+    ...d,
+    items: itemsResult.rows.filter((i) => i.dispatch_id === d.id)
+  })));
 });
 
 module.exports = router;

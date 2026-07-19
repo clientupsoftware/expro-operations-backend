@@ -28,7 +28,7 @@ function buildAlertEmailHtml(rule, balance) {
 async function getBalance(padId, explosiveTypeId) {
   const result = await pool.query(`
     SELECT
-      COALESCE(SUM(CASE WHEN tipo_movimiento = 'entrada' THEN cantidad ELSE 0 END), 0)
+      COALESCE(SUM(CASE WHEN tipo_movimiento IN ('entrada', 'devolucion') THEN cantidad ELSE 0 END), 0)
         - COALESCE(SUM(CASE WHEN tipo_movimiento = 'salida' THEN cantidad ELSE 0 END), 0) AS balance
     FROM explosive_stock_movements
     WHERE pad_id = $1 AND explosive_type_id = $2

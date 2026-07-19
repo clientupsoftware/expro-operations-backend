@@ -454,13 +454,8 @@ router.post('/programs/:id/dispatch', requireRole('mantenimiento'), async (req, 
          VALUES ($1,$2,$3,$4)`,
         [dispatchId, item.explosive_type_id, cantidadProgramada, cantidad]
       );
-      await client.query(
-        `INSERT INTO explosive_stock_movements
-          (pad_id, explosive_type_id, tipo_movimiento, cantidad, fecha, job_id, dispatch_id, detalle, created_by)
-         VALUES ($1,$2,'entrada',$3,CURRENT_DATE,$4,$5,$6,$7)`,
-        [padId, item.explosive_type_id, cantidad, job_id, dispatchId,
-         `Despacho desde Programa "${programDetail.nombre || ('#' + programId)}"`, req.user.id]
-      );
+      // OJO: el movimiento de stock (entrada) NO se crea aca todavia - queda pendiente
+      // hasta que Operaciones confirme la recepcion en pozo (ver POST /dispatches/:id/confirm).
       itemsCreados += 1;
     }
 
@@ -503,6 +498,76 @@ router.get('/programs/:id/dispatches', async (req, res) => {
     ...d,
     items: itemsResult.rows.filter((i) => i.dispatch_id === d.id)
   })));
+});
+
+// POST /api/explosives/dispatches/:id/confirm - Operaciones confirma que recibio el despacho
+// en pozo. Recien aca se genera el movimiento real de entrada de stock (antes solo era un
+// "pendiente" - mismo patron que el semaforo Amarillo->Verde de Assets).
+router.post('/dispatches/:id/confirm', requireAuth, async (req, res) => {
+  const { id } = req.params;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const dispatchResult = await client.query('SELECT * FROM explosive_program_dispatches WHERE id = $1', [id]);
+    if (dispatchResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Despacho no encontrado.' });
+    }
+    const dispatch = dispatchResult.rows[0];
+    if (dispatch.confirmado) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Este despacho ya estaba confirmado.' });
+    }
+
+    const itemsResult = await client.query(
+      `SELECT explosive_program_dispatch_items.*, explosive_types.descripcion
+       FROM explosive_program_dispatch_items
+       JOIN explosive_types ON explosive_types.id = explosive_program_dispatch_items.explosive_type_id
+       WHERE dispatch_id = $1`,
+      [id]
+    );
+
+    const programResult = await client.query('SELECT nombre FROM explosive_programs WHERE id = $1', [dispatch.program_id]);
+    const programNombre = programResult.rows[0]?.nombre || `#${dispatch.program_id}`;
+
+    for (const item of itemsResult.rows) {
+      await client.query(
+        `INSERT INTO explosive_stock_movements
+          (pad_id, explosive_type_id, tipo_movimiento, cantidad, fecha, job_id, dispatch_id, detalle, created_by)
+         VALUES ($1,$2,'entrada',$3,CURRENT_DATE,$4,$5,$6,$7)`,
+        [dispatch.pad_id, item.explosive_type_id, item.cantidad, dispatch.job_id, dispatch.id,
+         `Despacho confirmado - Programa "${programNombre}"`, req.user.id]
+      );
+    }
+
+    await client.query(
+      'UPDATE explosive_program_dispatches SET confirmado = true, confirmado_por = $1, confirmado_at = now() WHERE id = $2',
+      [req.user.id, id]
+    );
+
+    await client.query('COMMIT');
+    res.json({ confirmado: true, items: itemsResult.rows.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al confirmar el despacho.' });
+  } finally {
+    client.release();
+  }
+});
+
+// DELETE /api/explosives/dispatches/:id - cancela un despacho que todavia NO fue confirmado
+// (si ya esta confirmado, hay stock real de por medio - no se puede borrar asi nomas).
+router.delete('/dispatches/:id', requireRole('mantenimiento'), async (req, res) => {
+  const dispatchResult = await pool.query('SELECT confirmado FROM explosive_program_dispatches WHERE id = $1', [req.params.id]);
+  if (dispatchResult.rows.length === 0) return res.status(404).json({ error: 'Despacho no encontrado.' });
+  if (dispatchResult.rows[0].confirmado) {
+    return res.status(400).json({ error: 'Este despacho ya fue confirmado - no se puede cancelar (ya genero stock real).' });
+  }
+  await pool.query('DELETE FROM explosive_program_dispatches WHERE id = $1', [req.params.id]);
+  res.status(204).send();
 });
 
 module.exports = router;
