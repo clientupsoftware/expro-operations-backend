@@ -25,8 +25,10 @@ const briefingRoutes = require('./briefing.routes');
 const serviceRequirementsRoutes = require('./serviceRequirements.routes');
 const explosivesRoutes = require('./explosives.routes');
 const jobDocumentsRoutes = require('./jobDocuments.routes');
+const explosiveStockRoutes = require('./explosiveStock.routes');
 const cron = require('node-cron');
 const { checkAssetAlerts } = require('./assetAlertChecker');
+const { checkExplosiveStockAlerts } = require('./explosiveStockAlertChecker');
 
 const app = express();
 
@@ -61,6 +63,7 @@ app.use('/api/briefing', briefingRoutes);
 app.use('/api/service-requirements', serviceRequirementsRoutes);
 app.use('/api/explosives', explosivesRoutes);
 app.use('/api/jobs', jobDocumentsRoutes);
+app.use('/api/explosive-stock', explosiveStockRoutes);
 
 // Rutas exclusivas del entorno de demostracion: solo existen si DEMO_MODE=true.
 // En produccion esta variable no esta seteada, asi que ni siquiera se monta la ruta.
@@ -92,5 +95,14 @@ cron.schedule('*/15 * * * *', async () => {
     }
   } catch (err) {
     console.error('Error en el chequeo periodico de alertas de assets:', err);
+  }
+
+  try {
+    const stockResult = await checkExplosiveStockAlerts();
+    if (stockResult.triggered > 0) {
+      console.log(`Chequeo de stock de explosivos: ${stockResult.triggered} alerta(s) de stock bajo disparada(s) de ${stockResult.checked} regla(s) activa(s).`);
+    }
+  } catch (err) {
+    console.error('Error en el chequeo periodico de stock de explosivos:', err);
   }
 });

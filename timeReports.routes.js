@@ -296,6 +296,62 @@ router.delete('/on-call/lines/:lineId', requireRole('coordinador', 'ingeniero'),
   }
 });
 
+// Genera (reemplazando lo que hubiera antes) las salidas de stock automaticas de una etapa,
+// en base a lo que REALMENTE disparo (no lo planeado): cañones que dispararon x cargas/cordon/
+// detonador por gun, mas el tapon si disparo. El pad se saca del Job al que pertenece el reporte.
+async function applyStageStockMovements(client, stage, configResultsInput) {
+  // Siempre se arranca de cero: se borran las salidas automaticas viejas de esta etapa
+  // (si las habia) antes de recalcular - asi nunca queda una salida vieja + una nueva sumadas.
+  await client.query('DELETE FROM explosive_stock_movements WHERE bundle_stage_id = $1', [stage.id]);
+
+  if (!stage.typology_id) return; // sin tipologia elegida, no hay nada que descontar
+
+  const padResult = await client.query(
+    `SELECT jobs.pad_id FROM time_reports JOIN jobs ON jobs.id = time_reports.job_id WHERE time_reports.id = $1`,
+    [stage.time_report_id]
+  );
+  const padId = padResult.rows[0]?.pad_id;
+  if (!padId) return;
+
+  const typologyResult = await client.query('SELECT * FROM explosive_typologies WHERE id = $1', [stage.typology_id]);
+  const typology = typologyResult.rows[0];
+  if (!typology) return;
+
+  const consumo = {}; // explosive_type_id -> cantidad
+  function sumar(typeId, cantidad) {
+    if (!typeId || !cantidad) return;
+    consumo[typeId] = (consumo[typeId] || 0) + cantidad;
+  }
+
+  if (typology.tiene_tapon && stage.tapon_fired) {
+    sumar(typology.tapon_detonador_primario_id, 1);
+    sumar(typology.tapon_detonador_secundario_id, 1);
+    sumar(typology.tapon_carga_poder_id, 1);
+  }
+
+  for (const cr of (configResultsInput || [])) {
+    if (!cr.typology_config_id || !cr.guns_fired) continue;
+    const configResult = await client.query('SELECT * FROM explosive_typology_configs WHERE id = $1', [cr.typology_config_id]);
+    const config = configResult.rows[0];
+    if (!config) continue;
+
+    sumar(config.charge_type_id, cr.guns_fired * (config.quantity_charges_per_gun || 0));
+    sumar(config.detonator_type_id, cr.guns_fired * 1);
+    sumar(config.detonating_cord_type_id, cr.guns_fired * (config.detonating_cord_length_m || 0));
+  }
+
+  for (const [explosiveTypeId, cantidad] of Object.entries(consumo)) {
+    if (cantidad <= 0) continue;
+    await client.query(
+      `INSERT INTO explosive_stock_movements
+        (pad_id, explosive_type_id, tipo_movimiento, cantidad, fecha, bundle_stage_id, detalle, created_by)
+       VALUES ($1,$2,'salida',$3,$4,$5,$6,$7)`,
+      [padId, explosiveTypeId, cantidad, stage.fecha || new Date(), stage.id,
+       `Consumo real de la etapa ${stage.etapa || stage.stage_number}`, stage.created_by]
+    );
+  }
+}
+
 // Valida que la etapa elegida para este Pozo sea correcta: si ya hay una etapa efectiva
 // igual o mayor cargada para ese mismo pozo (dentro de este reporte), hace falta que venga
 // confirmado como "repunzado" - si no, se rechaza. Etapas marcadas NO efectivas no bloquean
@@ -412,6 +468,7 @@ router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'),
     const stage = stageResult.rows[0];
 
     await setStageConfigResults(client, stage.id, config_results);
+    await applyStageStockMovements(client, stage, config_results);
 
     const assetsToLink = asset_ids || [];
     for (const item of assetsToLink) {
@@ -515,6 +572,12 @@ router.patch('/bundle/stages/:stageId', requireRole('coordinador', 'ingeniero'),
     if (Array.isArray(config_results)) {
       await setStageConfigResults(client, stageId, config_results);
     }
+
+    const currentConfigResults = await client.query(
+      'SELECT typology_config_id, guns_fired FROM bundle_stage_config_results WHERE bundle_stage_id = $1',
+      [stageId]
+    );
+    await applyStageStockMovements(client, updated.rows[0], currentConfigResults.rows);
 
     await client.query('COMMIT');
     res.json({ ...updated.rows[0], assets: newAssetIds.map((id) => ({ asset_id: id })), config_results: config_results || [] });
