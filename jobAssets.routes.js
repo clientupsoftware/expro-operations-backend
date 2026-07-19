@@ -2,6 +2,7 @@ const express = require('express');
 const pool = require('./db');
 const { requireAuth } = require('./authMiddleware');
 const { requireRole } = require('./permissionsMiddleware');
+const { exportShippingListToWord } = require('./shippingListExport');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -110,13 +111,22 @@ router.post('/:jobId/generate-shipping-list', requireRole('coordinador', 'ingeni
     );
     const listId = shippingList.rows[0].id;
 
+    // Antes de borrar y recrear los items, guardamos que unidad de transporte tenia asignada
+    // cada asset - para no perder ese trabajo si se regenera la lista despues.
+    const previousAssignments = await client.query(
+      'SELECT asset_id, transport_unit_id FROM shipping_list_items WHERE shipping_list_id = $1 AND transport_unit_id IS NOT NULL',
+      [listId]
+    );
+    const transportByAsset = {};
+    previousAssignments.rows.forEach((r) => { transportByAsset[r.asset_id] = r.transport_unit_id; });
+
     await client.query('DELETE FROM shipping_list_items WHERE shipping_list_id = $1', [listId]);
 
     for (const asset of confirmedAssets.rows) {
       await client.query(
-        `INSERT INTO shipping_list_items (shipping_list_id, asset_id, asset_name, serial_number)
-         VALUES ($1, $2, $3, $4)`,
-        [listId, asset.asset_id, asset.description, asset.serial_number]
+        `INSERT INTO shipping_list_items (shipping_list_id, asset_id, asset_name, serial_number, transport_unit_id)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [listId, asset.asset_id, asset.description, asset.serial_number, transportByAsset[asset.asset_id] || null]
       );
     }
 
@@ -134,13 +144,105 @@ router.post('/:jobId/generate-shipping-list', requireRole('coordinador', 'ingeni
 // GET /api/job-assets/:jobId/shipping-list
 router.get('/:jobId/shipping-list', async (req, res) => {
   const listResult = await pool.query('SELECT * FROM shipping_lists WHERE job_id = $1', [req.params.jobId]);
-  if (listResult.rows.length === 0) return res.json({ items: [] });
+  if (listResult.rows.length === 0) return res.json({ items: [], transport_units: [] });
 
-  const itemsResult = await pool.query(
-    'SELECT * FROM shipping_list_items WHERE shipping_list_id = $1',
-    [listResult.rows[0].id]
+  const listId = listResult.rows[0].id;
+  const itemsResult = await pool.query('SELECT * FROM shipping_list_items WHERE shipping_list_id = $1', [listId]);
+  const unitsResult = await pool.query('SELECT * FROM shipping_list_transport_units WHERE shipping_list_id = $1 ORDER BY orden', [listId]);
+  res.json({ generated_at: listResult.rows[0].generated_at, items: itemsResult.rows, transport_units: unitsResult.rows });
+});
+
+// POST /api/job-assets/:jobId/shipping-list/transport-units - crear una unidad de transporte
+router.post('/:jobId/shipping-list/transport-units', requireRole('coordinador', 'ingeniero'), async (req, res) => {
+  const { tipo, patente } = req.body;
+  if (!tipo) return res.status(400).json({ error: 'tipo es requerido.' });
+
+  const listResult = await pool.query('SELECT id FROM shipping_lists WHERE job_id = $1', [req.params.jobId]);
+  if (listResult.rows.length === 0) return res.status(400).json({ error: 'Primero hay que generar la Shipping List.' });
+  const listId = listResult.rows[0].id;
+
+  const ordenResult = await pool.query(
+    'SELECT COALESCE(MAX(orden), -1) + 1 AS siguiente FROM shipping_list_transport_units WHERE shipping_list_id = $1',
+    [listId]
   );
-  res.json({ generated_at: listResult.rows[0].generated_at, items: itemsResult.rows });
+  const result = await pool.query(
+    'INSERT INTO shipping_list_transport_units (shipping_list_id, tipo, patente, orden) VALUES ($1,$2,$3,$4) RETURNING *',
+    [listId, tipo, patente || null, ordenResult.rows[0].siguiente]
+  );
+  res.status(201).json(result.rows[0]);
+});
+
+// PATCH /api/job-assets/:jobId/shipping-list/transport-units/:unitId
+router.patch('/:jobId/shipping-list/transport-units/:unitId', requireRole('coordinador', 'ingeniero'), async (req, res) => {
+  const { tipo, patente } = req.body;
+  const setClauses = [];
+  const values = [];
+  if (tipo !== undefined) { values.push(tipo); setClauses.push(`tipo = $${values.length}`); }
+  if (patente !== undefined) { values.push(patente || null); setClauses.push(`patente = $${values.length}`); }
+  if (setClauses.length === 0) return res.status(400).json({ error: 'Nada para actualizar.' });
+  values.push(req.params.unitId);
+  const result = await pool.query(
+    `UPDATE shipping_list_transport_units SET ${setClauses.join(', ')} WHERE id = $${values.length} RETURNING *`,
+    values
+  );
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Unidad no encontrada.' });
+  res.json(result.rows[0]);
+});
+
+// DELETE /api/job-assets/:jobId/shipping-list/transport-units/:unitId
+// Los items que estaban asignados a esta unidad quedan "sin asignar" (ON DELETE SET NULL).
+router.delete('/:jobId/shipping-list/transport-units/:unitId', requireRole('coordinador', 'ingeniero'), async (req, res) => {
+  await pool.query('DELETE FROM shipping_list_transport_units WHERE id = $1', [req.params.unitId]);
+  res.status(204).send();
+});
+
+// PATCH /api/job-assets/:jobId/shipping-list/items/:itemId - asignar (o desasignar, con null) un item a una unidad
+router.patch('/:jobId/shipping-list/items/:itemId', requireRole('coordinador', 'ingeniero'), async (req, res) => {
+  const { transport_unit_id } = req.body;
+  const result = await pool.query(
+    'UPDATE shipping_list_items SET transport_unit_id = $1 WHERE id = $2 RETURNING *',
+    [transport_unit_id || null, req.params.itemId]
+  );
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Item no encontrado.' });
+  res.json(result.rows[0]);
+});
+
+// GET /api/job-assets/:jobId/shipping-list/export - descarga el remito en Word, agrupado por unidad
+router.get('/:jobId/shipping-list/export', async (req, res) => {
+  try {
+    const jobResult = await pool.query(`
+      SELECT jobs.job_number, clients.name AS client_name, pads.name AS pad_name
+      FROM jobs JOIN pads ON pads.id = jobs.pad_id JOIN clients ON clients.id = pads.client_id
+      WHERE jobs.id = $1
+    `, [req.params.jobId]);
+    if (jobResult.rows.length === 0) return res.status(404).json({ error: 'Job no encontrado.' });
+
+    const listResult = await pool.query('SELECT * FROM shipping_lists WHERE job_id = $1', [req.params.jobId]);
+    if (listResult.rows.length === 0) return res.status(400).json({ error: 'Todavia no se genero la Shipping List.' });
+    const listId = listResult.rows[0].id;
+
+    const itemsResult = await pool.query('SELECT * FROM shipping_list_items WHERE shipping_list_id = $1', [listId]);
+    const unitsResult = await pool.query('SELECT * FROM shipping_list_transport_units WHERE shipping_list_id = $1 ORDER BY orden', [listId]);
+
+    const itemsByUnit = {};
+    const unassignedItems = [];
+    itemsResult.rows.forEach((it) => {
+      if (it.transport_unit_id) {
+        if (!itemsByUnit[it.transport_unit_id]) itemsByUnit[it.transport_unit_id] = [];
+        itemsByUnit[it.transport_unit_id].push(it);
+      } else {
+        unassignedItems.push(it);
+      }
+    });
+
+    const filePath = await exportShippingListToWord({
+      job: jobResult.rows[0], transportUnits: unitsResult.rows, itemsByUnit, unassignedItems
+    });
+    res.download(filePath);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al generar el remito.' });
+  }
 });
 
 module.exports = router;

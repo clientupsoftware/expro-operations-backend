@@ -34,6 +34,23 @@ router.get('/', async (req, res) => {
 });
 
 // GET /api/jobs/:id - detalle completo de un job (banner + contexto activo)
+// GET /api/jobs/next-number - sugiere el proximo N de Trabajo, consecutivo al ultimo cargado
+// (mismo prefijo, incrementa la parte numerica). Se declara antes de /:id a proposito.
+router.get('/next-number', async (req, res) => {
+  const result = await pool.query(
+    `SELECT job_number FROM jobs WHERE job_number IS NOT NULL AND job_number != '' ORDER BY created_at DESC LIMIT 1`
+  );
+  if (result.rows.length === 0) return res.json({ suggestion: null });
+
+  const last = result.rows[0].job_number;
+  const match = last.match(/^(.*?)(\d+)$/);
+  if (!match) return res.json({ suggestion: null }); // no se pudo parsear un numero al final, no se sugiere nada
+
+  const [, prefix, digits] = match;
+  const nextNum = (parseInt(digits, 10) + 1).toString().padStart(digits.length, '0');
+  res.json({ suggestion: `${prefix}${nextNum}` });
+});
+
 router.get('/:id', async (req, res) => {
   const { id } = req.params;
   const jobResult = await pool.query(`
