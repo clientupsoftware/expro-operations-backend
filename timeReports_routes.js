@@ -61,9 +61,9 @@ async function snapshotTemplateToReport(client, templateId, timeReportId) {
   );
   for (const s of slots.rows) {
     await client.query(
-      `INSERT INTO time_report_asset_slots (time_report_id, label, orden, unit_type_id, excel_columna)
-       VALUES ($1,$2,$3,$4,$5)`,
-      [timeReportId, s.label, s.orden, s.unit_type_id, s.excel_columna]
+      `INSERT INTO time_report_asset_slots (time_report_id, label, orden, excel_columna)
+       VALUES ($1,$2,$3,$4)`,
+      [timeReportId, s.label, s.orden, s.excel_columna]
     );
   }
 }
@@ -456,12 +456,10 @@ router.get('/bundle/:reportId/fields', async (req, res) => {
     'SELECT * FROM time_report_time_fields WHERE time_report_id = $1 ORDER BY orden',
     [req.params.reportId]
   );
-  const assetSlots = await pool.query(`
-    SELECT time_report_asset_slots.*, unit_types.name AS unit_type_name
-    FROM time_report_asset_slots
-    LEFT JOIN unit_types ON unit_types.id = time_report_asset_slots.unit_type_id
-    WHERE time_report_id = $1 ORDER BY orden
-  `, [req.params.reportId]);
+  const assetSlots = await pool.query(
+    'SELECT * FROM time_report_asset_slots WHERE time_report_id = $1 ORDER BY orden',
+    [req.params.reportId]
+  );
   res.json({ time_fields: timeFields.rows, asset_slots: assetSlots.rows });
 });
 

@@ -32,12 +32,10 @@ router.get('/:id', async (req, res) => {
     'SELECT * FROM report_template_time_fields WHERE template_id = $1 ORDER BY orden',
     [req.params.id]
   );
-  const assetSlots = await pool.query(`
-    SELECT report_template_asset_slots.*, unit_types.name AS unit_type_name
-    FROM report_template_asset_slots
-    LEFT JOIN unit_types ON unit_types.id = report_template_asset_slots.unit_type_id
-    WHERE template_id = $1 ORDER BY orden
-  `, [req.params.id]);
+  const assetSlots = await pool.query(
+    'SELECT * FROM report_template_asset_slots WHERE template_id = $1 ORDER BY orden',
+    [req.params.id]
+  );
   const file = await pool.query(
     'SELECT id, nombre_archivo, hoja, fila_inicio, uploaded_at FROM report_template_files WHERE template_id = $1',
     [req.params.id]
@@ -124,27 +122,27 @@ router.delete('/time-fields/:fieldId', requireRole('coordinador', 'super'), asyn
 // ================= SLOTS DE ASSET =================
 
 router.post('/:id/asset-slots', requireRole('coordinador', 'super'), async (req, res) => {
-  const { label, unit_type_id, excel_columna } = req.body;
+  const { label, excel_columna } = req.body;
   if (!label || !label.trim()) return res.status(400).json({ error: 'El label es obligatorio.' });
   const maxOrden = await pool.query(
     'SELECT COALESCE(MAX(orden), 0) AS max_orden FROM report_template_asset_slots WHERE template_id = $1',
     [req.params.id]
   );
   const result = await pool.query(
-    `INSERT INTO report_template_asset_slots (template_id, label, orden, unit_type_id, excel_columna)
-     VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [req.params.id, label.trim(), maxOrden.rows[0].max_orden + 1, unit_type_id || null, excel_columna || null]
+    `INSERT INTO report_template_asset_slots (template_id, label, orden, excel_columna)
+     VALUES ($1,$2,$3,$4) RETURNING *`,
+    [req.params.id, label.trim(), maxOrden.rows[0].max_orden + 1, excel_columna || null]
   );
   res.status(201).json(result.rows[0]);
 });
 
 router.patch('/asset-slots/:slotId', requireRole('coordinador', 'super'), async (req, res) => {
-  const { label, unit_type_id, excel_columna, orden } = req.body;
+  const { label, excel_columna, orden } = req.body;
   const result = await pool.query(
     `UPDATE report_template_asset_slots SET
-       label = COALESCE($1, label), unit_type_id = $2, excel_columna = $3, orden = COALESCE($4, orden)
-     WHERE id = $5 RETURNING *`,
-    [label?.trim() || null, unit_type_id || null, excel_columna || null, orden, req.params.slotId]
+       label = COALESCE($1, label), excel_columna = $2, orden = COALESCE($3, orden)
+     WHERE id = $4 RETURNING *`,
+    [label?.trim() || null, excel_columna || null, orden, req.params.slotId]
   );
   if (result.rows.length === 0) return res.status(404).json({ error: 'Slot no encontrado.' });
   res.json(result.rows[0]);
