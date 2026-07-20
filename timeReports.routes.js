@@ -39,6 +39,35 @@ async function unregisterRuns(client, assetIds, jobId, source) {
   }
 }
 
+// Copia ("snapshot") los campos de tiempo y slots de asset de una plantilla
+// (report_templates) hacia las tablas propias del reporte recien creado.
+// Se hace una sola vez, al crear el reporte - editar la plantilla despues
+// no afecta a este reporte ya creado.
+async function snapshotTemplateToReport(client, templateId, timeReportId) {
+  const fields = await client.query(
+    'SELECT * FROM report_template_time_fields WHERE template_id = $1 ORDER BY orden',
+    [templateId]
+  );
+  for (const f of fields.rows) {
+    await client.query(
+      `INSERT INTO time_report_time_fields (time_report_id, label, orden, obligatorio, tipo_campo, excel_columna)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [timeReportId, f.label, f.orden, f.obligatorio, f.tipo_campo, f.excel_columna]
+    );
+  }
+  const slots = await client.query(
+    'SELECT * FROM report_template_asset_slots WHERE template_id = $1 ORDER BY orden',
+    [templateId]
+  );
+  for (const s of slots.rows) {
+    await client.query(
+      `INSERT INTO time_report_asset_slots (time_report_id, label, orden, excel_columna)
+       VALUES ($1,$2,$3,$4)`,
+      [timeReportId, s.label, s.orden, s.excel_columna]
+    );
+  }
+}
+
 // GET /api/time-reports/:jobId - reportes existentes de un job
 router.get('/:jobId', async (req, res) => {
   const result = await pool.query(
@@ -49,16 +78,39 @@ router.get('/:jobId', async (req, res) => {
 });
 
 // POST /api/time-reports/:jobId - el ingeniero elige el tipo de reporte al empezar
+// Para 'bundle_pp' es obligatorio elegir tambien una plantilla (report_template_id):
+// sus campos/slots se copian ("snapshot") a este reporte en el momento de creacion.
 router.post('/:jobId', requireRole('coordinador', 'ingeniero'), async (req, res) => {
-  const { report_type } = req.body; // 'on_call' | 'bundle_pp'
+  const { report_type, report_template_id } = req.body; // 'on_call' | 'bundle_pp'
   if (!['on_call', 'bundle_pp'].includes(report_type)) {
     return res.status(400).json({ error: "report_type debe ser 'on_call' o 'bundle_pp'." });
   }
-  const result = await pool.query(
-    'INSERT INTO time_reports (job_id, report_type, created_by) VALUES ($1, $2, $3) RETURNING *',
-    [req.params.jobId, report_type, req.user.id]
-  );
-  res.status(201).json(result.rows[0]);
+  if (report_type === 'bundle_pp' && !report_template_id) {
+    return res.status(400).json({ error: 'Elegi una plantilla de reporte para Bundle P&P.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      'INSERT INTO time_reports (job_id, report_type, report_template_id, created_by) VALUES ($1, $2, $3, $4) RETURNING *',
+      [req.params.jobId, report_type, report_type === 'bundle_pp' ? report_template_id : null, req.user.id]
+    );
+    const report = result.rows[0];
+
+    if (report_type === 'bundle_pp') {
+      await snapshotTemplateToReport(client, report_template_id, report.id);
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json(report);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al crear el reporte.' });
+  } finally {
+    client.release();
+  }
 });
 
 // DELETE /api/time-reports/:id - solo si el reporte todavia esta vacio (sin lineas ni stages cargadas).
@@ -396,17 +448,33 @@ async function setStageConfigResults(client, stageId, configResults) {
 
 // ================= BUNDLE P&P =================
 
+// GET /api/time-reports/bundle/:reportId/fields - los campos de tiempo y slots de asset
+// de ESTE reporte puntual (el snapshot, no la plantilla maestra). El frontend usa esto
+// para dibujar el formulario de la stage de forma dinamica.
+router.get('/bundle/:reportId/fields', async (req, res) => {
+  const timeFields = await pool.query(
+    'SELECT * FROM time_report_time_fields WHERE time_report_id = $1 ORDER BY orden',
+    [req.params.reportId]
+  );
+  const assetSlots = await pool.query(
+    'SELECT * FROM time_report_asset_slots WHERE time_report_id = $1 ORDER BY orden',
+    [req.params.reportId]
+  );
+  res.json({ time_fields: timeFields.rows, asset_slots: assetSlots.rows });
+});
+
 router.get('/bundle/:reportId/stages', async (req, res) => {
   const stagesResult = await pool.query(
     'SELECT * FROM bundle_stages WHERE time_report_id = $1 ORDER BY stage_number',
     [req.params.reportId]
   );
+  const stageIds = stagesResult.rows.map((s) => s.id);
   const assetsResult = await pool.query(`
     SELECT bundle_stage_assets.*, assets.description, assets.sap_equipment_code
     FROM bundle_stage_assets
     JOIN assets ON assets.id = bundle_stage_assets.asset_id
     WHERE bundle_stage_id = ANY($1::int[])
-  `, [stagesResult.rows.map((s) => s.id)]);
+  `, [stageIds]);
   const configResultsResult = await pool.query(`
     SELECT bundle_stage_config_results.*, explosive_types.descripcion AS charge_type_descripcion
     FROM bundle_stage_config_results
@@ -414,15 +482,33 @@ router.get('/bundle/:reportId/stages', async (req, res) => {
     JOIN explosive_types ON explosive_types.id = explosive_typology_configs.charge_type_id
     WHERE bundle_stage_id = ANY($1::int[])
     ORDER BY orden
-  `, [stagesResult.rows.map((s) => s.id)]);
+  `, [stageIds]);
+  const fieldValuesResult = await pool.query(
+    'SELECT * FROM time_report_field_values WHERE bundle_stage_id = ANY($1::int[])',
+    [stageIds]
+  );
 
   const stages = stagesResult.rows.map((stage) => ({
     ...stage,
     assets: assetsResult.rows.filter((a) => a.bundle_stage_id === stage.id),
-    config_results: configResultsResult.rows.filter((c) => c.bundle_stage_id === stage.id)
+    config_results: configResultsResult.rows.filter((c) => c.bundle_stage_id === stage.id),
+    field_values: fieldValuesResult.rows.filter((fv) => fv.bundle_stage_id === stage.id)
   }));
   res.json(stages);
 });
+
+// Reemplaza (delete + insert) los valores de campos de tiempo de una stage.
+async function setStageFieldValues(client, stageId, fieldValues) {
+  await client.query('DELETE FROM time_report_field_values WHERE bundle_stage_id = $1', [stageId]);
+  for (const fv of (fieldValues || [])) {
+    if (!fv.time_report_time_field_id) continue;
+    await client.query(
+      `INSERT INTO time_report_field_values (bundle_stage_id, time_report_time_field_id, valor)
+       VALUES ($1,$2,$3)`,
+      [stageId, fv.time_report_time_field_id, fv.valor ?? null]
+    );
+  }
+}
 
 // POST /api/time-reports/bundle/:reportId/stages
 // Cada Stage se considera automaticamente una carrera completa para los assets involucrados.
@@ -450,10 +536,8 @@ router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'),
          time_report_id, well_id, stage_number, etapa, etapa_efectiva, es_repunzado,
          typology_id, tapon_fired, fecha, plug_type,
          engineer_id, crew_leader_id, crew_member_2_id, crew_member_3_id, crew_member_4_id,
-         time_well_to_wl, time_rih, time_start_pump_down, time_poo,
-         time_bha_in_lubricator, time_well_return, well_pressure,
          plug_problem, hse_issue, misfire, comentarios, created_by
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
        RETURNING *`,
       [reportId, body.well_id || null, nextStageNumber, body.etapa || null,
        body.etapa_efectiva !== false, body.es_repunzado || false,
@@ -461,21 +545,21 @@ router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'),
        body.fecha || null, body.plug_type || null,
        body.engineer_id || null, body.crew_leader_id || null,
        body.crew_member_2_id || null, body.crew_member_3_id || null, body.crew_member_4_id || null,
-       body.time_well_to_wl || null, body.time_rih || null, body.time_start_pump_down || null,
-       body.time_poo || null, body.time_bha_in_lubricator || null, body.time_well_return || null,
-       body.well_pressure || null, body.plug_problem || false, body.hse_issue || false,
+       body.plug_problem || false, body.hse_issue || false,
        body.misfire || false, body.comentarios || null, req.user.id]
     );
     const stage = stageResult.rows[0];
 
     await setStageConfigResults(client, stage.id, config_results);
     await applyStageStockMovements(client, stage, config_results);
+    await setStageFieldValues(client, stage.id, body.field_values);
 
     const assetsToLink = asset_ids || [];
     for (const item of assetsToLink) {
       await client.query(
-        'INSERT INTO bundle_stage_assets (bundle_stage_id, asset_id, string_label) VALUES ($1, $2, $3)',
-        [stage.id, item.asset_id, item.string_label || null]
+        `INSERT INTO bundle_stage_assets (bundle_stage_id, asset_id, string_label, time_report_asset_slot_id)
+         VALUES ($1, $2, $3, $4)`,
+        [stage.id, item.asset_id, item.string_label || null, item.slot_id || null]
       );
     }
 
@@ -485,7 +569,7 @@ router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'),
     }
 
     await client.query('COMMIT');
-    res.status(201).json({ ...stage, assets: assetsToLink, config_results: config_results || [] });
+    res.status(201).json({ ...stage, assets: assetsToLink, config_results: config_results || [], field_values: body.field_values || [] });
   } catch (err) {
     await client.query('ROLLBACK');
     if (err.isSequenceError) return res.status(409).json({ error: err.message });
@@ -543,19 +627,15 @@ router.patch('/bundle/stages/:stageId', requireRole('coordinador', 'ingeniero'),
          well_id = $1, etapa = $2, etapa_efectiva = $3, es_repunzado = $4,
          typology_id = $5, tapon_fired = $6, fecha = $7, plug_type = $8,
          engineer_id = $9, crew_leader_id = $10, crew_member_2_id = $11, crew_member_3_id = $12, crew_member_4_id = $13,
-         time_well_to_wl = $14, time_rih = $15, time_start_pump_down = $16, time_poo = $17,
-         time_bha_in_lubricator = $18, time_well_return = $19, well_pressure = $20,
-         plug_problem = $21, hse_issue = $22, misfire = $23, comentarios = $24
-       WHERE id = $25 RETURNING *`,
+         plug_problem = $14, hse_issue = $15, misfire = $16, comentarios = $17
+       WHERE id = $18 RETURNING *`,
       [
         body.well_id || null, body.etapa || null, body.etapa_efectiva !== false, body.es_repunzado || false,
         body.typology_id || null, body.tapon_fired === undefined ? null : body.tapon_fired,
         body.fecha || null, body.plug_type || null,
         body.engineer_id || null, body.crew_leader_id || null,
         body.crew_member_2_id || null, body.crew_member_3_id || null, body.crew_member_4_id || null,
-        body.time_well_to_wl || null, body.time_rih || null, body.time_start_pump_down || null,
-        body.time_poo || null, body.time_bha_in_lubricator || null, body.time_well_return || null,
-        body.well_pressure || null, body.plug_problem || false, body.hse_issue || false,
+        body.plug_problem || false, body.hse_issue || false,
         body.misfire || false, body.comentarios || null, stageId
       ]
     );
@@ -564,14 +644,19 @@ router.patch('/bundle/stages/:stageId', requireRole('coordinador', 'ingeniero'),
       await client.query('DELETE FROM bundle_stage_assets WHERE bundle_stage_id = $1', [stageId]);
       for (const item of asset_ids) {
         await client.query(
-          'INSERT INTO bundle_stage_assets (bundle_stage_id, asset_id, string_label) VALUES ($1, $2, $3)',
-          [stageId, item.asset_id, item.string_label || null]
+          `INSERT INTO bundle_stage_assets (bundle_stage_id, asset_id, string_label, time_report_asset_slot_id)
+           VALUES ($1, $2, $3, $4)`,
+          [stageId, item.asset_id, item.string_label || null, item.slot_id || null]
         );
       }
     }
 
     if (Array.isArray(config_results)) {
       await setStageConfigResults(client, stageId, config_results);
+    }
+
+    if (Array.isArray(body.field_values)) {
+      await setStageFieldValues(client, stageId, body.field_values);
     }
 
     const currentConfigResults = await client.query(
@@ -581,7 +666,7 @@ router.patch('/bundle/stages/:stageId', requireRole('coordinador', 'ingeniero'),
     await applyStageStockMovements(client, updated.rows[0], currentConfigResults.rows);
 
     await client.query('COMMIT');
-    res.json({ ...updated.rows[0], assets: newAssetIds.map((id) => ({ asset_id: id })), config_results: config_results || [] });
+    res.json({ ...updated.rows[0], assets: newAssetIds.map((id) => ({ asset_id: id })), config_results: config_results || [], field_values: body.field_values || [] });
   } catch (err) {
     await client.query('ROLLBACK');
     if (err.isSequenceError) return res.status(409).json({ error: err.message });
