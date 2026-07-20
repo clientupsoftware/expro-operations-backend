@@ -26,6 +26,7 @@ const serviceRequirementsRoutes = require('./serviceRequirements.routes');
 const explosivesRoutes = require('./explosives.routes');
 const jobDocumentsRoutes = require('./jobDocuments.routes');
 const explosiveStockRoutes = require('./explosiveStock.routes');
+const reportTemplatesRoutes = require('./reportTemplates.routes');
 const cron = require('node-cron');
 const { checkAssetAlerts } = require('./assetAlertChecker');
 const { checkExplosiveStockAlerts } = require('./explosiveStockAlertChecker');
@@ -64,6 +65,7 @@ app.use('/api/service-requirements', serviceRequirementsRoutes);
 app.use('/api/explosives', explosivesRoutes);
 app.use('/api/jobs', jobDocumentsRoutes);
 app.use('/api/explosive-stock', explosiveStockRoutes);
+app.use('/api/report-templates', reportTemplatesRoutes);
 
 // Rutas exclusivas del entorno de demostracion: solo existen si DEMO_MODE=true.
 // En produccion esta variable no esta seteada, asi que ni siquiera se monta la ruta.
