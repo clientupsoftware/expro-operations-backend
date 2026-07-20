@@ -90,7 +90,10 @@ async function insertTypologyConfigs(client, typologyId, configs) {
 }
 
 router.post('/typologies', requireRole('mantenimiento'), async (req, res) => {
-  const { nombre, tiene_tapon, tapon_detonador_primario_id, tapon_detonador_secundario_id, tapon_carga_poder_id, configs } = req.body;
+  const {
+    nombre, tiene_tapon, tapon_detonador_primario_id, tapon_detonador_secundario_id,
+    tapon_carga_poder_id, plug_to_first_cluster_length_m, configs
+  } = req.body;
   if (!nombre) return res.status(400).json({ error: 'nombre es requerido.' });
   if (!Array.isArray(configs) || configs.length === 0) {
     return res.status(400).json({ error: 'configs (array, al menos 1 configuracion de gun) es requerido.' });
@@ -102,13 +105,15 @@ router.post('/typologies', requireRole('mantenimiento'), async (req, res) => {
     const tieneTapon = tiene_tapon !== false;
     const typologyResult = await client.query(
       `INSERT INTO explosive_typologies
-        (nombre, tiene_tapon, tapon_detonador_primario_id, tapon_detonador_secundario_id, tapon_carga_poder_id, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+        (nombre, tiene_tapon, tapon_detonador_primario_id, tapon_detonador_secundario_id, tapon_carga_poder_id,
+         plug_to_first_cluster_length_m, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
       [
         nombre, tieneTapon,
         tieneTapon ? (tapon_detonador_primario_id || null) : null,
         tieneTapon ? (tapon_detonador_secundario_id || null) : null,
         tieneTapon ? (tapon_carga_poder_id || null) : null,
+        tieneTapon ? (plug_to_first_cluster_length_m || null) : null,
         req.user.id
       ]
     );
@@ -130,7 +135,10 @@ router.post('/typologies', requireRole('mantenimiento'), async (req, res) => {
 
 router.patch('/typologies/:id', requireRole('mantenimiento'), async (req, res) => {
   const { id } = req.params;
-  const { nombre, tiene_tapon, tapon_detonador_primario_id, tapon_detonador_secundario_id, tapon_carga_poder_id, configs } = req.body;
+  const {
+    nombre, tiene_tapon, tapon_detonador_primario_id, tapon_detonador_secundario_id,
+    tapon_carga_poder_id, plug_to_first_cluster_length_m, configs
+  } = req.body;
 
   if (configs !== undefined && (!Array.isArray(configs) || configs.length === 0)) {
     return res.status(400).json({ error: 'Si mandas configs, tiene que ser un array con al menos 1 elemento.' });
@@ -148,6 +156,7 @@ router.patch('/typologies/:id', requireRole('mantenimiento'), async (req, res) =
       values.push(tiene_tapon ? (tapon_detonador_primario_id || null) : null); setClauses.push(`tapon_detonador_primario_id = $${values.length}`);
       values.push(tiene_tapon ? (tapon_detonador_secundario_id || null) : null); setClauses.push(`tapon_detonador_secundario_id = $${values.length}`);
       values.push(tiene_tapon ? (tapon_carga_poder_id || null) : null); setClauses.push(`tapon_carga_poder_id = $${values.length}`);
+      values.push(tiene_tapon ? (plug_to_first_cluster_length_m || null) : null); setClauses.push(`plug_to_first_cluster_length_m = $${values.length}`);
     }
 
     if (setClauses.length > 0) {

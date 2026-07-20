@@ -536,8 +536,8 @@ router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'),
          time_report_id, well_id, stage_number, etapa, etapa_efectiva, es_repunzado,
          typology_id, tapon_fired, fecha, plug_type,
          engineer_id, crew_leader_id, crew_member_2_id, crew_member_3_id, crew_member_4_id,
-         plug_problem, hse_issue, misfire, comentarios, created_by
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+         plug_problem, hse_issue, misfire, comentarios, plug_depth_m, ccl_to_top_shot_ref_m, created_by
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
        RETURNING *`,
       [reportId, body.well_id || null, nextStageNumber, body.etapa || null,
        body.etapa_efectiva !== false, body.es_repunzado || false,
@@ -546,7 +546,10 @@ router.post('/bundle/:reportId/stages', requireRole('coordinador', 'ingeniero'),
        body.engineer_id || null, body.crew_leader_id || null,
        body.crew_member_2_id || null, body.crew_member_3_id || null, body.crew_member_4_id || null,
        body.plug_problem || false, body.hse_issue || false,
-       body.misfire || false, body.comentarios || null, req.user.id]
+       body.misfire || false, body.comentarios || null,
+       body.plug_depth_m === '' ? null : body.plug_depth_m || null,
+       body.ccl_to_top_shot_ref_m === '' ? null : body.ccl_to_top_shot_ref_m || null,
+       req.user.id]
     );
     const stage = stageResult.rows[0];
 
@@ -627,8 +630,9 @@ router.patch('/bundle/stages/:stageId', requireRole('coordinador', 'ingeniero'),
          well_id = $1, etapa = $2, etapa_efectiva = $3, es_repunzado = $4,
          typology_id = $5, tapon_fired = $6, fecha = $7, plug_type = $8,
          engineer_id = $9, crew_leader_id = $10, crew_member_2_id = $11, crew_member_3_id = $12, crew_member_4_id = $13,
-         plug_problem = $14, hse_issue = $15, misfire = $16, comentarios = $17
-       WHERE id = $18 RETURNING *`,
+         plug_problem = $14, hse_issue = $15, misfire = $16, comentarios = $17,
+         plug_depth_m = $18, ccl_to_top_shot_ref_m = $19
+       WHERE id = $20 RETURNING *`,
       [
         body.well_id || null, body.etapa || null, body.etapa_efectiva !== false, body.es_repunzado || false,
         body.typology_id || null, body.tapon_fired === undefined ? null : body.tapon_fired,
@@ -636,7 +640,10 @@ router.patch('/bundle/stages/:stageId', requireRole('coordinador', 'ingeniero'),
         body.engineer_id || null, body.crew_leader_id || null,
         body.crew_member_2_id || null, body.crew_member_3_id || null, body.crew_member_4_id || null,
         body.plug_problem || false, body.hse_issue || false,
-        body.misfire || false, body.comentarios || null, stageId
+        body.misfire || false, body.comentarios || null,
+        body.plug_depth_m === '' ? null : body.plug_depth_m || null,
+        body.ccl_to_top_shot_ref_m === '' ? null : body.ccl_to_top_shot_ref_m || null,
+        stageId
       ]
     );
 
