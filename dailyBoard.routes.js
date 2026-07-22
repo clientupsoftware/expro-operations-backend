@@ -176,6 +176,67 @@ router.delete('/:id', requireRole('coordinador'), async (req, res) => {
   res.status(204).send();
 });
 
+// POST /api/daily-board/:id/duplicate - copia esta entrada a una nueva (misma unidad, pozo,
+// cliente, servicios, supervisor/guinchero/ayudante, etc.), lista para ajustar y guardar.
+// No hereda el estado (arranca en Prox. Operacion), el vinculo a Job, ni los comentarios por
+// dia (son especificos de la entrada original).
+router.post('/:id/duplicate', requireRole('coordinador'), async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const originalResult = await client.query('SELECT * FROM daily_board_entries WHERE id = $1', [id]);
+    if (originalResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Entrada no encontrada.' });
+    }
+    const o = originalResult.rows[0];
+
+    const insertedResult = await client.query(
+      `INSERT INTO daily_board_entries
+         (estado, fecha_inicio, fecha_fin, unidad, pozo, tipo_unidad, client_id, edp, servicios, created_by)
+       VALUES ('proxima_operacion', $1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      [o.fecha_inicio, o.fecha_fin, o.unidad, o.pozo, o.tipo_unidad, o.client_id, o.edp, o.servicios, req.user.id]
+    );
+    const newEntry = insertedResult.rows[0];
+
+    const assignmentsResult = await client.query(
+      'SELECT role, turno, personnel_id, text_fallback FROM daily_board_assignments WHERE entry_id = $1',
+      [id]
+    );
+    for (const a of assignmentsResult.rows) {
+      await client.query(
+        'INSERT INTO daily_board_assignments (entry_id, role, turno, personnel_id, text_fallback) VALUES ($1,$2,$3,$4,$5)',
+        [newEntry.id, a.role, a.turno, a.personnel_id, a.text_fallback]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    const assignmentsWithNames = await pool.query(`
+      SELECT daily_board_assignments.*, personnel.name AS personnel_name
+      FROM daily_board_assignments
+      LEFT JOIN personnel ON personnel.id = daily_board_assignments.personnel_id
+      WHERE entry_id = $1
+    `, [newEntry.id]);
+
+    res.status(201).json({
+      ...newEntry,
+      assignments: assignmentsWithNames.rows.map((a) => ({
+        id: a.id, role: a.role, turno: a.turno, personnel_id: a.personnel_id, name: a.personnel_name || a.text_fallback
+      })),
+      comments: []
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Error al duplicar la entrada.' });
+  } finally {
+    client.release();
+  }
+});
+
 // POST /api/daily-board/:id/promote - convierte la entrada en un Job real (PreJob)
 router.post('/:id/promote', requireRole('coordinador'), async (req, res) => {
   const { id } = req.params;
