@@ -273,10 +273,12 @@ router.delete('/:id', requireRole('super'), async (req, res) => {
     await client.query('BEGIN');
 
     // Desvincula (sin borrar) registros que deben sobrevivir a la eliminacion del Job:
-    // el historial de carreras de los assets (importante para mantenimiento preventivo)
-    // y la entrada de Parte Diario de origen, si la tenia.
+    // el historial de carreras de los assets (importante para mantenimiento preventivo),
+    // la entrada de Parte Diario de origen, y los Reportes de Falla (compliance/historial),
+    // si los tenia.
     await client.query('UPDATE asset_runs SET job_id = NULL WHERE job_id = $1', [id]);
     await client.query('UPDATE daily_board_entries SET job_id = NULL WHERE job_id = $1', [id]);
+    await client.query('UPDATE failure_reports SET job_id = NULL WHERE job_id = $1', [id]);
 
     // Estas dos tablas se agregaron en migraciones posteriores al schema original y por las
     // dudas no tengan ON DELETE CASCADE configurado: se limpian explicitamente antes de borrar el Job.
