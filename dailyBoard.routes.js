@@ -3,6 +3,7 @@ const multer = require('multer');
 const pool = require('./db');
 const { requireAuth } = require('./authMiddleware');
 const { requireRole } = require('./permissionsMiddleware');
+const { applyDailyBoardAutoTransitions } = require('./dailyBoardStatusChecker');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -25,11 +26,13 @@ async function replaceAssignments(client, entryId, assignments) {
 
 // GET /api/daily-board - todos los roles ven el tablero completo
 router.get('/', async (req, res) => {
+  await applyDailyBoardAutoTransitions();
+
   const entriesResult = await pool.query(`
     SELECT daily_board_entries.*, clients.name AS client_name
     FROM daily_board_entries
     LEFT JOIN clients ON clients.id = daily_board_entries.client_id
-    ORDER BY daily_board_entries.fecha DESC NULLS LAST, daily_board_entries.id DESC
+    ORDER BY daily_board_entries.fecha_inicio DESC NULLS LAST, daily_board_entries.id DESC
   `);
 
   const assignmentsResult = await pool.query(`
@@ -38,11 +41,18 @@ router.get('/', async (req, res) => {
     LEFT JOIN personnel ON personnel.id = daily_board_assignments.personnel_id
   `);
 
+  const commentsResult = await pool.query(`
+    SELECT * FROM daily_board_comments ORDER BY fecha ASC
+  `);
+
   const entries = entriesResult.rows.map((entry) => ({
     ...entry,
     assignments: assignmentsResult.rows
       .filter((a) => a.entry_id === entry.id)
-      .map((a) => ({ id: a.id, role: a.role, turno: a.turno, personnel_id: a.personnel_id, name: a.personnel_name || a.text_fallback }))
+      .map((a) => ({ id: a.id, role: a.role, turno: a.turno, personnel_id: a.personnel_id, name: a.personnel_name || a.text_fallback })),
+    comments: commentsResult.rows
+      .filter((c) => c.entry_id === entry.id)
+      .map((c) => ({ fecha: c.fecha.toISOString ? c.fecha.toISOString().slice(0, 10) : c.fecha, comentario: c.comentario }))
   }));
 
   res.json(entries);
@@ -50,17 +60,17 @@ router.get('/', async (req, res) => {
 
 // POST /api/daily-board - crear entrada (Coordinador/Super)
 router.post('/', requireRole('coordinador'), async (req, res) => {
-  const { estado, fecha, unidad, pozo, tipo_unidad, client_id, edp, servicios, comentarios, assignments } = req.body;
+  const { estado, fecha_inicio, fecha_fin, unidad, pozo, tipo_unidad, client_id, edp, servicios, assignments } = req.body;
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const result = await client.query(
       `INSERT INTO daily_board_entries
-         (estado, fecha, unidad, pozo, tipo_unidad, client_id, edp, servicios, comentarios, created_by)
+         (estado, fecha_inicio, fecha_fin, unidad, pozo, tipo_unidad, client_id, edp, servicios, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [estado || 'proxima_operacion', fecha || null, unidad || null, pozo || null, tipo_unidad || null,
-       client_id || null, edp || null, servicios || null, comentarios || null, req.user.id]
+      [estado || 'proxima_operacion', fecha_inicio || null, fecha_fin || fecha_inicio || null, unidad || null, pozo || null,
+       tipo_unidad || null, client_id || null, edp || null, servicios || null, req.user.id]
     );
     const entry = result.rows[0];
 
@@ -78,7 +88,7 @@ router.post('/', requireRole('coordinador'), async (req, res) => {
 });
 
 // PATCH /api/daily-board/:id - editar cualquier campo (Coordinador/Super)
-const EDITABLE_FIELDS = ['estado', 'fecha', 'unidad', 'pozo', 'tipo_unidad', 'client_id', 'edp', 'servicios', 'comentarios'];
+const EDITABLE_FIELDS = ['estado', 'fecha_inicio', 'fecha_fin', 'unidad', 'pozo', 'tipo_unidad', 'client_id', 'edp', 'servicios'];
 router.patch('/:id', requireRole('coordinador'), async (req, res) => {
   const setClauses = [];
   const values = [];
@@ -137,6 +147,27 @@ router.patch('/:id', requireRole('coordinador'), async (req, res) => {
   } finally {
     client.release();
   }
+});
+
+// PUT /api/daily-board/:id/comments - upsert del comentario de un dia puntual dentro del
+// rango de la entrada. Mandar comentario vacio/null borra el comentario de ese dia.
+router.put('/:id/comments', requireRole('coordinador'), async (req, res) => {
+  const { fecha, comentario } = req.body;
+  if (!fecha) return res.status(400).json({ error: 'fecha es requerida.' });
+
+  if (!comentario || !comentario.trim()) {
+    await pool.query('DELETE FROM daily_board_comments WHERE entry_id = $1 AND fecha = $2', [req.params.id, fecha]);
+    return res.json({ fecha, comentario: null });
+  }
+
+  const result = await pool.query(
+    `INSERT INTO daily_board_comments (entry_id, fecha, comentario, updated_by, updated_at)
+     VALUES ($1, $2, $3, $4, now())
+     ON CONFLICT (entry_id, fecha) DO UPDATE SET comentario = $3, updated_by = $4, updated_at = now()
+     RETURNING fecha, comentario`,
+    [req.params.id, fecha, comentario.trim(), req.user.id]
+  );
+  res.json(result.rows[0]);
 });
 
 // DELETE /api/daily-board/:id (Coordinador/Super)
@@ -212,9 +243,11 @@ router.post('/:id/promote', requireRole('coordinador'), async (req, res) => {
 });
 
 // POST /api/daily-board/import - carga masiva desde un Excel con el mismo formato de "Exportar a Excel"
-// (Estado, Fecha, Unidad, Pozo, Un., Cliente, EDP, Servicios, Supervisor, Comments).
+// (Estado, Fecha Inicio, Fecha Fin, Unidad, Pozo, Un., Cliente, EDP, Servicios, Supervisor, Comments).
 // El Supervisor se carga como texto libre (text_fallback), igual que cuando hoy se escribe
 // "nombre no listado" en el picker - queda 100% editable despues desde la UI normal.
+// El comentario importado (si viene) se guarda como el comentario del dia de fecha_inicio;
+// para aclarar dia por dia hay que editarlo despues desde la UI.
 router.post('/import', requireRole('coordinador'), upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Falta el archivo (campo "file").' });
 
@@ -258,20 +291,21 @@ router.post('/import', requireRole('coordinador'), upload.single('file'), async 
   sheet.eachRow((row, rowNumber) => {
     if (rowNumber === 1) return; // encabezado
     const v = row.values; // v[0] vacio en exceljs, columnas arrancan en v[1]
-    const pozo = cellText(v[4]);
-    const fecha = parseFecha(v[2]);
-    if (!pozo && !fecha) return; // fila vacia
+    const pozo = cellText(v[5]);
+    const fechaInicio = parseFecha(v[2]);
+    if (!pozo && !fechaInicio) return; // fila vacia
     rows.push({
       estado: parseEstado(v[1]),
-      fecha,
-      unidad: cellText(v[3]),
+      fecha_inicio: fechaInicio,
+      fecha_fin: parseFecha(v[3]) || fechaInicio,
+      unidad: cellText(v[4]),
       pozo,
-      tipo_unidad: cellText(v[5]),
-      cliente_nombre: cellText(v[6]),
-      edp: cellText(v[7]),
-      servicios: cellText(v[8]),
-      supervisor: cellText(v[9]),
-      comentarios: cellText(v[10])
+      tipo_unidad: cellText(v[6]),
+      cliente_nombre: cellText(v[7]),
+      edp: cellText(v[8]),
+      servicios: cellText(v[9]),
+      supervisor: cellText(v[10]),
+      comentarios: cellText(v[11])
     });
   });
 
@@ -303,11 +337,18 @@ router.post('/import', requireRole('coordinador'), upload.single('file'), async 
 
       const entryResult = await client.query(
         `INSERT INTO daily_board_entries
-           (estado, fecha, unidad, pozo, tipo_unidad, client_id, edp, servicios, comentarios, created_by)
+           (estado, fecha_inicio, fecha_fin, unidad, pozo, tipo_unidad, client_id, edp, servicios, created_by)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-        [row.estado, row.fecha, row.unidad, row.pozo, row.tipo_unidad, clientId, row.edp, row.servicios, row.comentarios, req.user.id]
+        [row.estado, row.fecha_inicio, row.fecha_fin, row.unidad, row.pozo, row.tipo_unidad, clientId, row.edp, row.servicios, req.user.id]
       );
       const entryId = entryResult.rows[0].id;
+
+      if (row.comentarios && row.fecha_inicio) {
+        await client.query(
+          'INSERT INTO daily_board_comments (entry_id, fecha, comentario, updated_by) VALUES ($1, $2, $3, $4)',
+          [entryId, row.fecha_inicio, row.comentarios, req.user.id]
+        );
+      }
 
       if (row.supervisor) {
         await client.query(
@@ -338,7 +379,7 @@ router.get('/export', async (req, res) => {
     SELECT daily_board_entries.*, clients.name AS client_name
     FROM daily_board_entries
     LEFT JOIN clients ON clients.id = daily_board_entries.client_id
-    ORDER BY daily_board_entries.fecha DESC NULLS LAST, daily_board_entries.id DESC
+    ORDER BY daily_board_entries.fecha_inicio DESC NULLS LAST, daily_board_entries.id DESC
   `);
 
   const assignmentsResult = await pool.query(`
@@ -347,6 +388,8 @@ router.get('/export', async (req, res) => {
     LEFT JOIN personnel ON personnel.id = daily_board_assignments.personnel_id
     WHERE role = 'supervisor'
   `);
+
+  const commentsResult = await pool.query(`SELECT * FROM daily_board_comments ORDER BY fecha ASC`);
 
   const ESTADO_LABELS = {
     proxima_operacion: 'Prox. Op', en_operacion: 'En Op.', operacion_finalizada: 'Op. Finalizada',
@@ -360,7 +403,7 @@ router.get('/export', async (req, res) => {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('Parte Diario');
 
-  const headers = ['Estado', 'Fecha', 'Unidad', 'Pozo', 'Un.', 'Cliente', 'EDP', 'Servicios', 'Supervisor', 'Comments'];
+  const headers = ['Estado', 'Fecha Inicio', 'Fecha Fin', 'Unidad', 'Pozo', 'Un.', 'Cliente', 'EDP', 'Servicios', 'Supervisor', 'Comments'];
   const headerRow = sheet.addRow(headers);
   headerRow.eachCell((cell) => {
     cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
@@ -372,18 +415,24 @@ router.get('/export', async (req, res) => {
     const supNoche = assignmentsResult.rows.filter((a) => a.entry_id === entry.id && a.turno === 'noche').map((a) => a.personnel_name || a.text_fallback);
     const supervisorCombined = [supDia.join(', '), supNoche.length ? `Noche: ${supNoche.join(', ')}` : ''].filter(Boolean).join(' / ');
 
+    const commentsCombined = commentsResult.rows
+      .filter((c) => c.entry_id === entry.id && c.comentario)
+      .map((c) => `${c.fecha.toISOString ? c.fecha.toISOString().slice(0, 10) : c.fecha}: ${c.comentario}`)
+      .join(' | ');
+
     const row = sheet.addRow([
       ESTADO_LABELS[entry.estado] || entry.estado,
-      entry.fecha, entry.unidad, entry.pozo, entry.tipo_unidad, entry.client_name, entry.edp, entry.servicios,
-      supervisorCombined, entry.comentarios
+      entry.fecha_inicio, entry.fecha_fin, entry.unidad, entry.pozo, entry.tipo_unidad, entry.client_name, entry.edp, entry.servicios,
+      supervisorCombined, commentsCombined
     ]);
     row.getCell(2).numFmt = 'dd-mmm';
+    row.getCell(3).numFmt = 'dd-mmm';
     const color = ESTADO_COLORS[entry.estado];
     if (color) row.getCell(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: color } };
   }
 
   sheet.columns.forEach((col) => { col.width = 16; });
-  sheet.getColumn(10).width = 40;
+  sheet.getColumn(11).width = 50;
   sheet.getColumn(1).width = 18;
 
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');

@@ -30,6 +30,7 @@ const reportTemplatesRoutes = require('./reportTemplates.routes');
 const cron = require('node-cron');
 const { checkAssetAlerts } = require('./assetAlertChecker');
 const { checkExplosiveStockAlerts } = require('./explosiveStockAlertChecker');
+const { applyDailyBoardAutoTransitions } = require('./dailyBoardStatusChecker');
 
 const app = express();
 
@@ -106,5 +107,19 @@ cron.schedule('*/15 * * * *', async () => {
     }
   } catch (err) {
     console.error('Error en el chequeo periodico de stock de explosivos:', err);
+  }
+});
+
+// Transiciones automaticas de estado en Parte Diario (Prox. Op -> En Op. -> Op. Finalizada
+// segun fecha_inicio/fecha_fin vs hoy). Corre una vez por dia a la madrugada - ademas el GET
+// del Parte Diario la dispara tambien al vuelo, asi que esto es redundancia/respaldo.
+cron.schedule('5 0 * * *', async () => {
+  try {
+    const result = await applyDailyBoardAutoTransitions();
+    if (result.finished > 0 || result.started > 0) {
+      console.log(`Parte Diario: ${result.started} entrada(s) pasaron a En Operacion, ${result.finished} a Op. Finalizada.`);
+    }
+  } catch (err) {
+    console.error('Error en las transiciones automaticas de Parte Diario:', err);
   }
 });
