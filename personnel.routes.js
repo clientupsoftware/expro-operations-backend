@@ -31,20 +31,20 @@ router.get('/crews', ah(async (req, res) => {
 }));
 
 router.post('/crews', requireRole('coordinador'), ah(async (req, res) => {
-  const { name, cycle_start_date, work_days, rest_days } = req.body;
+  const { name, cycle_start_date, work_days, rest_days, color } = req.body;
   if (!name || !cycle_start_date) return res.status(400).json({ error: 'name y cycle_start_date son requeridos.' });
   const result = await pool.query(
-    'INSERT INTO crews (name, cycle_start_date, work_days, rest_days) VALUES ($1, $2, $3, $4) RETURNING *',
-    [name, cycle_start_date, work_days || 14, rest_days || 7]
+    'INSERT INTO crews (name, cycle_start_date, work_days, rest_days, color) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+    [name, cycle_start_date, work_days || 14, rest_days || 7, color || '#4caf7d']
   );
   res.status(201).json(result.rows[0]);
 }));
 
 router.put('/crews/:id', requireRole('coordinador'), ah(async (req, res) => {
-  const { name, cycle_start_date, work_days, rest_days } = req.body;
+  const { name, cycle_start_date, work_days, rest_days, color } = req.body;
   const result = await pool.query(
-    'UPDATE crews SET name = $1, cycle_start_date = $2, work_days = $3, rest_days = $4 WHERE id = $5 RETURNING *',
-    [name, cycle_start_date, work_days || 14, rest_days || 7, req.params.id]
+    'UPDATE crews SET name = $1, cycle_start_date = $2, work_days = $3, rest_days = $4, color = $5 WHERE id = $6 RETURNING *',
+    [name, cycle_start_date, work_days || 14, rest_days || 7, color || '#4caf7d', req.params.id]
   );
   if (result.rows.length === 0) return res.status(404).json({ error: 'Cuadrilla no encontrada.' });
   res.json(result.rows[0]);
@@ -63,7 +63,7 @@ function buildFullName(apellido, nombre) {
 
 router.get('/', ah(async (req, res) => {
   const result = await pool.query(`
-    SELECT personnel.*, crews.name AS crew_name, crews.cycle_start_date, crews.work_days, crews.rest_days
+    SELECT personnel.*, crews.name AS crew_name, crews.cycle_start_date, crews.work_days, crews.rest_days, crews.color AS crew_color
     FROM personnel
     LEFT JOIN crews ON crews.id = personnel.crew_id
     ORDER BY personnel.apellido, personnel.nombre
@@ -345,7 +345,7 @@ router.get('/status', ah(async (req, res) => {
   const date = req.query.date || new Date().toISOString().slice(0, 10);
 
   const personnelResult = await pool.query(`
-    SELECT personnel.*, crews.name AS crew_name, crews.cycle_start_date, crews.work_days, crews.rest_days
+    SELECT personnel.*, crews.name AS crew_name, crews.cycle_start_date, crews.work_days, crews.rest_days, crews.color AS crew_color
     FROM personnel
     LEFT JOIN crews ON crews.id = personnel.crew_id
     WHERE personnel.active = true
@@ -391,7 +391,7 @@ router.get('/stats', ah(async (req, res) => {
   const date = req.query.date || new Date().toISOString().slice(0, 10);
 
   const personnelResult = await pool.query(`
-    SELECT personnel.*, crews.cycle_start_date, crews.work_days, crews.rest_days
+    SELECT personnel.*, crews.cycle_start_date, crews.work_days, crews.rest_days, crews.color AS crew_color
     FROM personnel
     LEFT JOIN crews ON crews.id = personnel.crew_id
     WHERE personnel.active = true
