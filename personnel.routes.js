@@ -360,13 +360,15 @@ router.get('/status', ah(async (req, res) => {
   overridesResult.rows.forEach((o) => { overridesByPerson[o.personnel_id] = o; });
 
   // Asignacion del dia: si esta persona figura en cualquier rol (supervisor/guinchero/ayudante,
-  // dia o noche) de alguna entrada de Parte Diario con esa misma fecha, mostramos el pozo de esa entrada.
+  // dia o noche) de alguna entrada de Parte Diario cuyo rango (fecha_inicio a fecha_fin) incluye
+  // esta fecha, mostramos el pozo de esa entrada.
   const assignmentByPerson = {};
   const assignmentsResult = await pool.query(`
     SELECT daily_board_assignments.personnel_id, daily_board_entries.pozo
     FROM daily_board_assignments
     JOIN daily_board_entries ON daily_board_entries.id = daily_board_assignments.entry_id
-    WHERE daily_board_entries.fecha = $1 AND daily_board_assignments.personnel_id IS NOT NULL
+    WHERE $1 BETWEEN daily_board_entries.fecha_inicio AND COALESCE(daily_board_entries.fecha_fin, daily_board_entries.fecha_inicio)
+      AND daily_board_assignments.personnel_id IS NOT NULL
   `, [date]);
   assignmentsResult.rows.forEach((row) => { assignmentByPerson[row.personnel_id] = row.pozo; });
 
