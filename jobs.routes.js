@@ -297,7 +297,9 @@ router.delete('/:id', requireRole('super'), async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK');
     console.error(err);
-    res.status(500).json({ error: 'Error al eliminar el Job. No se borro nada.' });
+    // DEBUG TEMPORAL: devolvemos el detalle real de Postgres para ver que constraint
+    // esta bloqueando el borrado. Sacar esto (volver al mensaje generico) una vez resuelto.
+    res.status(500).json({ error: 'Error al eliminar el Job. No se borro nada.', detail: err.message, constraint: err.constraint || null, table: err.table || null });
   } finally {
     client.release();
   }
