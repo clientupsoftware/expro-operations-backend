@@ -20,17 +20,20 @@ router.get('/operations', async (req, res) => {
   const porEstado = await pool.query(
     `SELECT estado, COUNT(*)::int AS cantidad
      FROM daily_board_entries
-     WHERE fecha BETWEEN $1 AND $2
+     WHERE fecha_inicio <= $2 AND COALESCE(fecha_fin, fecha_inicio) >= $1
      GROUP BY estado`,
     [from, to]
   );
 
+  // Tendencia dia por dia: se expande cada entrada a todos los dias de su rango que caen
+  // dentro de la ventana pedida, asi un trabajo de varios dias cuenta en cada uno de ellos.
   const tendencia = await pool.query(
-    `SELECT fecha::date AS fecha, estado, COUNT(*)::int AS cantidad
-     FROM daily_board_entries
-     WHERE fecha BETWEEN $1 AND $2
-     GROUP BY fecha, estado
-     ORDER BY fecha`,
+    `SELECT d::date AS fecha, daily_board_entries.estado, COUNT(*)::int AS cantidad
+     FROM generate_series($1::date, $2::date, interval '1 day') AS d
+     JOIN daily_board_entries
+       ON d::date BETWEEN daily_board_entries.fecha_inicio AND COALESCE(daily_board_entries.fecha_fin, daily_board_entries.fecha_inicio)
+     GROUP BY d, daily_board_entries.estado
+     ORDER BY d`,
     [from, to]
   );
 
@@ -38,7 +41,7 @@ router.get('/operations', async (req, res) => {
     `SELECT COALESCE(clients.name, 'Sin cliente') AS cliente, COUNT(*)::int AS cantidad
      FROM daily_board_entries
      LEFT JOIN clients ON clients.id = daily_board_entries.client_id
-     WHERE daily_board_entries.fecha BETWEEN $1 AND $2
+     WHERE daily_board_entries.fecha_inicio <= $2 AND COALESCE(daily_board_entries.fecha_fin, daily_board_entries.fecha_inicio) >= $1
      GROUP BY clients.name
      ORDER BY cantidad DESC
      LIMIT 10`,
@@ -46,7 +49,8 @@ router.get('/operations', async (req, res) => {
   );
 
   const total = await pool.query(
-    `SELECT COUNT(*)::int AS total FROM daily_board_entries WHERE fecha BETWEEN $1 AND $2`,
+    `SELECT COUNT(*)::int AS total FROM daily_board_entries
+     WHERE fecha_inicio <= $2 AND COALESCE(fecha_fin, fecha_inicio) >= $1`,
     [from, to]
   );
 
