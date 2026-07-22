@@ -280,6 +280,7 @@ router.delete('/:id', requireRole('super'), async (req, res) => {
     await client.query('UPDATE daily_board_entries SET job_id = NULL WHERE job_id = $1', [id]);
     await client.query('UPDATE failure_reports SET job_id = NULL WHERE job_id = $1', [id]);
     await client.query('UPDATE explosive_stock_movements SET job_id = NULL WHERE job_id = $1', [id]);
+    await client.query('UPDATE explosive_program_dispatches SET job_id = NULL WHERE job_id = $1', [id]);
 
     // Estas dos tablas se agregaron en migraciones posteriores al schema original y por las
     // dudas no tengan ON DELETE CASCADE configurado: se limpian explicitamente antes de borrar el Job.
@@ -300,9 +301,7 @@ router.delete('/:id', requireRole('super'), async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK');
     console.error(err);
-    // DEBUG TEMPORAL: devolvemos el detalle real de Postgres para ver que constraint
-    // esta bloqueando el borrado. Sacar esto (volver al mensaje generico) una vez resuelto.
-    res.status(500).json({ error: 'Error al eliminar el Job. No se borro nada.', detail: err.message, constraint: err.constraint || null, table: err.table || null });
+    res.status(500).json({ error: 'Error al eliminar el Job. No se borro nada.' });
   } finally {
     client.release();
   }
