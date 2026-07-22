@@ -279,6 +279,7 @@ router.delete('/:id', requireRole('super'), async (req, res) => {
     await client.query('UPDATE asset_runs SET job_id = NULL WHERE job_id = $1', [id]);
     await client.query('UPDATE daily_board_entries SET job_id = NULL WHERE job_id = $1', [id]);
     await client.query('UPDATE failure_reports SET job_id = NULL WHERE job_id = $1', [id]);
+    await client.query('UPDATE explosive_stock_movements SET job_id = NULL WHERE job_id = $1', [id]);
 
     // Estas dos tablas se agregaron en migraciones posteriores al schema original y por las
     // dudas no tengan ON DELETE CASCADE configurado: se limpian explicitamente antes de borrar el Job.
