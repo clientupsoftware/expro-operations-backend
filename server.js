@@ -35,7 +35,9 @@ const { applyDailyBoardAutoTransitions } = require('./dailyBoardStatusChecker');
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+// Limite subido a 15mb: la captura del Gantt de Parte Diario (enviada como base64 desde el
+// boton "Enviar por Email") pesa mas que el limite default de Express (100kb).
+app.use(express.json({ limit: '15mb' }));
 
 // Health check simple, util para verificar que Railway levanto el servicio
 app.get('/', (req, res) => {
