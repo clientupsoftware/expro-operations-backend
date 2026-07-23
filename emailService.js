@@ -23,8 +23,14 @@ async function sendEmail({ to, subject, html, attachments }) {
     html
   };
   if (attachments && attachments.length > 0) {
-    // Resend espera el contenido en base64 (sin el prefijo "data:...;base64,")
-    body.attachments = attachments.map((a) => ({ filename: a.filename, content: a.contentBase64 }));
+    // Resend espera el contenido en base64 (sin el prefijo "data:...;base64,").
+    // content_id (opcional) permite referenciar el adjunto como <img src="cid:..."> en el
+    // HTML - necesario porque Gmail/Outlook bloquean las imagenes embebidas como data URI directo.
+    body.attachments = attachments.map((a) => ({
+      filename: a.filename,
+      content: a.contentBase64,
+      ...(a.contentId ? { content_id: a.contentId } : {})
+    }));
   }
 
   const res = await fetch(RESEND_API_URL, {
@@ -75,19 +81,28 @@ async function sendFailureReportNotification(report, recipients) {
 async function sendDailyBoardEmail({ recipients, excelBuffer, excelFilename, ganttImageBase64 }) {
   if (!recipients || recipients.length === 0) return { skipped: true };
 
+  // ganttImageBase64 llega como data URI completo (data:image/png;base64,AAAA...) - Resend
+  // necesita solo la parte base64, sin el prefijo, para el adjunto.
+  const ganttBase64Content = ganttImageBase64 ? ganttImageBase64.split(',')[1] : null;
+
   const html = `
     <div style="font-family: Arial, sans-serif; max-width: 640px;">
       <p>Estimados, adjunto parte diario actual.</p>
-      ${ganttImageBase64 ? `<img src="${ganttImageBase64}" alt="Gantt Parte Diario" style="max-width:100%; border:1px solid #ccc; border-radius:6px; margin: 12px 0;" />` : ''}
+      ${ganttBase64Content ? `<img src="cid:gantt-image" alt="Gantt Parte Diario" style="max-width:100%; border:1px solid #ccc; border-radius:6px; margin: 12px 0;" />` : ''}
       <p>Saludos.</p>
     </div>
   `;
+
+  const attachments = [{ filename: excelFilename, contentBase64: excelBuffer.toString('base64') }];
+  if (ganttBase64Content) {
+    attachments.push({ filename: 'gantt.png', contentBase64: ganttBase64Content, contentId: 'gantt-image' });
+  }
 
   return sendEmail({
     to: recipients,
     subject: `WellOps - Parte Diario`,
     html,
-    attachments: [{ filename: excelFilename, contentBase64: excelBuffer.toString('base64') }]
+    attachments
   });
 }
 
