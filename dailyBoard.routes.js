@@ -433,8 +433,9 @@ router.post('/import', requireRole('coordinador'), upload.single('file'), async 
   }
 });
 
-// GET /api/daily-board/export - descarga el Excel con el mismo formato de siempre
-router.get('/export', async (req, res) => {
+// Genera el mismo Workbook que ya arma "Exportar a Excel" - se comparte entre el endpoint
+// de descarga y el de envio por email, para que ambos queden siempre identicos.
+async function buildDailyBoardWorkbook() {
   const ExcelJS = require('exceljs');
   const entriesResult = await pool.query(`
     SELECT daily_board_entries.*, clients.name AS client_name
@@ -496,10 +497,75 @@ router.get('/export', async (req, res) => {
   sheet.getColumn(11).width = 50;
   sheet.getColumn(1).width = 18;
 
+  return workbook;
+}
+
+// GET /api/daily-board/export - descarga el Excel con el mismo formato de siempre
+router.get('/export', async (req, res) => {
+  const workbook = await buildDailyBoardWorkbook();
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', 'attachment; filename="Parte_Diario.xlsx"');
   await workbook.xlsx.write(res);
   res.end();
+});
+
+// ================= DESTINATARIOS FRECUENTES (boton "Enviar por Email") =================
+
+router.get('/email-recipients', async (req, res) => {
+  const result = await pool.query('SELECT * FROM daily_board_email_recipients ORDER BY nombre, email');
+  res.json(result.rows);
+});
+
+router.post('/email-recipients', requireRole('coordinador'), async (req, res) => {
+  const { nombre, email } = req.body;
+  if (!email || !email.trim()) return res.status(400).json({ error: 'email es requerido.' });
+  const result = await pool.query(
+    'INSERT INTO daily_board_email_recipients (nombre, email) VALUES ($1, $2) RETURNING *',
+    [nombre || null, email.trim()]
+  );
+  res.status(201).json(result.rows[0]);
+});
+
+router.delete('/email-recipients/:id', requireRole('coordinador'), async (req, res) => {
+  await pool.query('DELETE FROM daily_board_email_recipients WHERE id = $1', [req.params.id]);
+  res.status(204).send();
+});
+
+// POST /api/daily-board/send-email - manda el Parte Diario (Excel adjunto + captura del
+// Gantt incrustada, generada por el frontend) a los destinatarios elegidos.
+router.post('/send-email', requireRole('coordinador'), async (req, res) => {
+  const { recipient_ids, gantt_image_base64 } = req.body;
+  if (!Array.isArray(recipient_ids) || recipient_ids.length === 0) {
+    return res.status(400).json({ error: 'Elegi al menos un destinatario.' });
+  }
+
+  const recipientsResult = await pool.query(
+    'SELECT email FROM daily_board_email_recipients WHERE id = ANY($1::int[])',
+    [recipient_ids]
+  );
+  const recipients = recipientsResult.rows.map((r) => r.email);
+  if (recipients.length === 0) return res.status(400).json({ error: 'No se encontraron los destinatarios elegidos.' });
+
+  const { sendDailyBoardEmail } = require('./emailService');
+  const workbook = await buildDailyBoardWorkbook();
+  const excelBuffer = await workbook.xlsx.writeBuffer();
+
+  const today = new Date();
+  const MONTH_LABELS_ES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
+  const excelFilename = `Parte diario ${String(today.getDate()).padStart(2, '0')}-${MONTH_LABELS_ES[today.getMonth()]}.xlsx`;
+
+  try {
+    await sendDailyBoardEmail({
+      recipients,
+      excelBuffer: Buffer.from(excelBuffer),
+      excelFilename,
+      ganttImageBase64: gantt_image_base64 || null
+    });
+    res.json({ sent: true, recipients });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error al enviar el email: ' + err.message });
+  }
 });
 
 module.exports = router;

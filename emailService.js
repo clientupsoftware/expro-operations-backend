@@ -9,11 +9,22 @@
 
 const RESEND_API_URL = 'https://api.resend.com/emails';
 
-async function sendEmail({ to, subject, html }) {
+async function sendEmail({ to, subject, html, attachments }) {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) {
     console.warn('RESEND_API_KEY no configurada - se omite el envio de email.');
     return { skipped: true };
+  }
+
+  const body = {
+    from: process.env.RESEND_FROM_EMAIL || 'WellOps <onboarding@resend.dev>',
+    to,
+    subject,
+    html
+  };
+  if (attachments && attachments.length > 0) {
+    // Resend espera el contenido en base64 (sin el prefijo "data:...;base64,")
+    body.attachments = attachments.map((a) => ({ filename: a.filename, content: a.contentBase64 }));
   }
 
   const res = await fetch(RESEND_API_URL, {
@@ -22,12 +33,7 @@ async function sendEmail({ to, subject, html }) {
       Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      from: process.env.RESEND_FROM_EMAIL || 'WellOps <onboarding@resend.dev>',
-      to,
-      subject,
-      html
-    })
+    body: JSON.stringify(body)
   });
 
   if (!res.ok) {
@@ -64,4 +70,25 @@ async function sendFailureReportNotification(report, recipients) {
   });
 }
 
-module.exports = { sendEmail, sendFailureReportNotification };
+// Arma y manda el mail de Parte Diario: Excel adjunto (mismo que "Exportar a Excel") +
+// la captura del Gantt (semana actual) incrustada como imagen en el cuerpo del mensaje.
+async function sendDailyBoardEmail({ recipients, excelBuffer, excelFilename, ganttImageBase64 }) {
+  if (!recipients || recipients.length === 0) return { skipped: true };
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 640px;">
+      <p>Estimados, adjunto parte diario actual.</p>
+      ${ganttImageBase64 ? `<img src="${ganttImageBase64}" alt="Gantt Parte Diario" style="max-width:100%; border:1px solid #ccc; border-radius:6px; margin: 12px 0;" />` : ''}
+      <p>Saludos.</p>
+    </div>
+  `;
+
+  return sendEmail({
+    to: recipients,
+    subject: `WellOps - Parte Diario`,
+    html,
+    attachments: [{ filename: excelFilename, contentBase64: excelBuffer.toString('base64') }]
+  });
+}
+
+module.exports = { sendEmail, sendFailureReportNotification, sendDailyBoardEmail };
