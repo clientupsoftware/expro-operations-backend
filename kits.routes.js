@@ -28,7 +28,7 @@ router.get('/', async (req, res) => {
 
 // POST /api/kits - crear un kit nuevo (Mantenimiento o Super). asset_ids: [1, 2, 3, ...]
 router.post('/', requireRole('mantenimiento'), async (req, res) => {
-  const { name, category, asset_ids } = req.body;
+  const { name, category, asset_ids, activo, tipo_cable } = req.body;
   if (!name || !Array.isArray(asset_ids) || asset_ids.length === 0) {
     return res.status(400).json({ error: 'name y asset_ids (array) son requeridos.' });
   }
@@ -37,8 +37,8 @@ router.post('/', requireRole('mantenimiento'), async (req, res) => {
   try {
     await client.query('BEGIN');
     const kitResult = await client.query(
-      'INSERT INTO kit_templates (name, category, created_by) VALUES ($1, $2, $3) RETURNING *',
-      [name, category || null, req.user.id]
+      'INSERT INTO kit_templates (name, category, activo, tipo_cable, created_by) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [name, category || null, activo === undefined ? true : activo, tipo_cable || null, req.user.id]
     );
     const kit = kitResult.rows[0];
 
@@ -65,7 +65,7 @@ router.post('/', requireRole('mantenimiento'), async (req, res) => {
 // asset_ids, si viene, reemplaza TODO el listado anterior (no es un agregar/quitar incremental).
 router.patch('/:id', requireRole('mantenimiento'), async (req, res) => {
   const { id } = req.params;
-  const { name, category, asset_ids } = req.body;
+  const { name, category, asset_ids, activo, tipo_cable } = req.body;
 
   if (asset_ids !== undefined && (!Array.isArray(asset_ids) || asset_ids.length === 0)) {
     return res.status(400).json({ error: 'Si mandas asset_ids, tiene que ser un array con al menos 1 elemento.' });
@@ -79,6 +79,8 @@ router.patch('/:id', requireRole('mantenimiento'), async (req, res) => {
     const values = [];
     if (name !== undefined) { values.push(name); setClauses.push(`name = $${values.length}`); }
     if (category !== undefined) { values.push(category || null); setClauses.push(`category = $${values.length}`); }
+    if (activo !== undefined) { values.push(activo); setClauses.push(`activo = $${values.length}`); }
+    if (tipo_cable !== undefined) { values.push(tipo_cable || null); setClauses.push(`tipo_cable = $${values.length}`); }
 
     let kit;
     if (setClauses.length > 0) {
