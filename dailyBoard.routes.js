@@ -45,6 +45,12 @@ router.get('/', async (req, res) => {
     SELECT * FROM daily_board_comments ORDER BY fecha ASC
   `);
 
+  const peripheralsResult = await pool.query(`
+    SELECT daily_board_entry_peripherals.*, job_peripheral_options.name AS option_name
+    FROM daily_board_entry_peripherals
+    JOIN job_peripheral_options ON job_peripheral_options.id = daily_board_entry_peripherals.option_id
+  `);
+
   const entries = entriesResult.rows.map((entry) => ({
     ...entry,
     assignments: assignmentsResult.rows
@@ -52,7 +58,10 @@ router.get('/', async (req, res) => {
       .map((a) => ({ id: a.id, role: a.role, turno: a.turno, personnel_id: a.personnel_id, name: a.personnel_name || a.text_fallback })),
     comments: commentsResult.rows
       .filter((c) => c.entry_id === entry.id)
-      .map((c) => ({ fecha: c.fecha.toISOString ? c.fecha.toISOString().slice(0, 10) : c.fecha, comentario: c.comentario }))
+      .map((c) => ({ fecha: c.fecha.toISOString ? c.fecha.toISOString().slice(0, 10) : c.fecha, comentario: c.comentario })),
+    peripherals: peripheralsResult.rows
+      .filter((p) => p.entry_id === entry.id)
+      .map((p) => ({ option_id: p.option_id, name: p.option_name }))
   }));
 
   res.json(entries);
@@ -60,21 +69,26 @@ router.get('/', async (req, res) => {
 
 // POST /api/daily-board - crear entrada (Coordinador/Super)
 router.post('/', requireRole('coordinador'), async (req, res) => {
-  const { estado, fecha_inicio, fecha_fin, unidad, pozo, tipo_unidad, client_id, edp, servicios, assignments } = req.body;
+  const {
+    estado, fecha_inicio, fecha_fin, hora_inicio, hora_fin, unidad, pozo, tipo_unidad,
+    client_id, edp, servicios, assignments, peripheral_ids
+  } = req.body;
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const result = await client.query(
       `INSERT INTO daily_board_entries
-         (estado, fecha_inicio, fecha_fin, unidad, pozo, tipo_unidad, client_id, edp, servicios, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [estado || 'proxima_operacion', fecha_inicio || null, fecha_fin || fecha_inicio || null, unidad || null, pozo || null,
+         (estado, fecha_inicio, fecha_fin, hora_inicio, hora_fin, unidad, pozo, tipo_unidad, client_id, edp, servicios, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+      [estado || 'proxima_operacion', fecha_inicio || null, fecha_fin || fecha_inicio || null,
+       hora_inicio || null, hora_fin || null, unidad || null, pozo || null,
        tipo_unidad || null, client_id || null, edp || null, servicios || null, req.user.id]
     );
     const entry = result.rows[0];
 
     await replaceAssignments(client, entry.id, assignments);
+    await replacePeripherals(client, entry.id, peripheral_ids);
 
     await client.query('COMMIT');
     res.status(201).json(entry);
@@ -87,8 +101,20 @@ router.post('/', requireRole('coordinador'), async (req, res) => {
   }
 });
 
+// Reemplaza (delete + insert) los perifericos elegidos para esta entrada.
+async function replacePeripherals(client, entryId, peripheralIds) {
+  if (!Array.isArray(peripheralIds)) return;
+  await client.query('DELETE FROM daily_board_entry_peripherals WHERE entry_id = $1', [entryId]);
+  for (const optionId of peripheralIds) {
+    await client.query(
+      'INSERT INTO daily_board_entry_peripherals (entry_id, option_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [entryId, optionId]
+    );
+  }
+}
+
 // PATCH /api/daily-board/:id - editar cualquier campo (Coordinador/Super)
-const EDITABLE_FIELDS = ['estado', 'fecha_inicio', 'fecha_fin', 'unidad', 'pozo', 'tipo_unidad', 'client_id', 'edp', 'servicios'];
+const EDITABLE_FIELDS = ['estado', 'fecha_inicio', 'fecha_fin', 'hora_inicio', 'hora_fin', 'unidad', 'pozo', 'tipo_unidad', 'client_id', 'edp', 'servicios'];
 router.patch('/:id', requireRole('coordinador'), async (req, res) => {
   const setClauses = [];
   const values = [];
@@ -99,7 +125,8 @@ router.patch('/:id', requireRole('coordinador'), async (req, res) => {
     }
   });
   const hasAssignments = Array.isArray(req.body.assignments);
-  if (setClauses.length === 0 && !hasAssignments) {
+  const hasPeripherals = Array.isArray(req.body.peripheral_ids);
+  if (setClauses.length === 0 && !hasAssignments && !hasPeripherals) {
     return res.status(400).json({ error: 'Nada para actualizar.' });
   }
 
@@ -123,6 +150,9 @@ router.patch('/:id', requireRole('coordinador'), async (req, res) => {
 
     if (hasAssignments) {
       await replaceAssignments(client, req.params.id, req.body.assignments);
+    }
+    if (hasPeripherals) {
+      await replacePeripherals(client, req.params.id, req.body.peripheral_ids);
     }
 
     if (!entry) {
@@ -195,9 +225,9 @@ router.post('/:id/duplicate', requireRole('coordinador'), async (req, res) => {
 
     const insertedResult = await client.query(
       `INSERT INTO daily_board_entries
-         (estado, fecha_inicio, fecha_fin, unidad, pozo, tipo_unidad, client_id, edp, servicios, created_by)
-       VALUES ('proxima_operacion', $1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [o.fecha_inicio, o.fecha_fin, o.unidad, o.pozo, o.tipo_unidad, o.client_id, o.edp, o.servicios, req.user.id]
+         (estado, fecha_inicio, fecha_fin, hora_inicio, hora_fin, unidad, pozo, tipo_unidad, client_id, edp, servicios, created_by)
+       VALUES ('proxima_operacion', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+      [o.fecha_inicio, o.fecha_fin, o.hora_inicio, o.hora_fin, o.unidad, o.pozo, o.tipo_unidad, o.client_id, o.edp, o.servicios, req.user.id]
     );
     const newEntry = insertedResult.rows[0];
 
@@ -212,6 +242,14 @@ router.post('/:id/duplicate', requireRole('coordinador'), async (req, res) => {
       );
     }
 
+    const peripheralsToCopy = await client.query(
+      'SELECT option_id FROM daily_board_entry_peripherals WHERE entry_id = $1',
+      [id]
+    );
+    for (const p of peripheralsToCopy.rows) {
+      await client.query('INSERT INTO daily_board_entry_peripherals (entry_id, option_id) VALUES ($1, $2)', [newEntry.id, p.option_id]);
+    }
+
     await client.query('COMMIT');
 
     const assignmentsWithNames = await pool.query(`
@@ -221,11 +259,19 @@ router.post('/:id/duplicate', requireRole('coordinador'), async (req, res) => {
       WHERE entry_id = $1
     `, [newEntry.id]);
 
+    const peripheralsWithNames = await pool.query(`
+      SELECT daily_board_entry_peripherals.*, job_peripheral_options.name AS option_name
+      FROM daily_board_entry_peripherals
+      JOIN job_peripheral_options ON job_peripheral_options.id = daily_board_entry_peripherals.option_id
+      WHERE entry_id = $1
+    `, [newEntry.id]);
+
     res.status(201).json({
       ...newEntry,
       assignments: assignmentsWithNames.rows.map((a) => ({
         id: a.id, role: a.role, turno: a.turno, personnel_id: a.personnel_id, name: a.personnel_name || a.text_fallback
       })),
+      peripherals: peripheralsWithNames.rows.map((p) => ({ option_id: p.option_id, name: p.option_name })),
       comments: []
     });
   } catch (err) {
@@ -288,6 +334,15 @@ router.post('/:id/promote', requireRole('coordinador'), async (req, res) => {
     await client.query('INSERT INTO job_wells (job_id, well_id) VALUES ($1, $2)', [job.id, well.id]);
     for (const serviceId of serviceIds) {
       await client.query('INSERT INTO job_services (job_id, service_id) VALUES ($1, $2)', [job.id, serviceId]);
+    }
+
+    // Los perifericos elegidos en el Parte Diario quedan preseleccionados en el Job real.
+    const peripheralsResult = await client.query(
+      'SELECT option_id FROM daily_board_entry_peripherals WHERE entry_id = $1',
+      [id]
+    );
+    for (const p of peripheralsResult.rows) {
+      await client.query('INSERT INTO job_peripherals (job_id, option_id) VALUES ($1, $2)', [job.id, p.option_id]);
     }
 
     await client.query(`UPDATE daily_board_entries SET job_id = $1, updated_at = now() WHERE id = $2`, [job.id, id]);
