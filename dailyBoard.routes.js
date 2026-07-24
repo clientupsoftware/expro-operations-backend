@@ -51,6 +51,8 @@ router.get('/', async (req, res) => {
     JOIN job_peripheral_options ON job_peripheral_options.id = daily_board_entry_peripherals.option_id
   `);
 
+  const resourcesResult = await pool.query('SELECT * FROM daily_board_entry_resources');
+
   const entries = entriesResult.rows.map((entry) => ({
     ...entry,
     assignments: assignmentsResult.rows
@@ -61,7 +63,10 @@ router.get('/', async (req, res) => {
       .map((c) => ({ fecha: c.fecha.toISOString ? c.fecha.toISOString().slice(0, 10) : c.fecha, comentario: c.comentario })),
     peripherals: peripheralsResult.rows
       .filter((p) => p.entry_id === entry.id)
-      .map((p) => ({ option_id: p.option_id, name: p.option_name }))
+      .map((p) => ({ option_id: p.option_id, name: p.option_name })),
+    resources: resourcesResult.rows
+      .filter((r) => r.entry_id === entry.id)
+      .map((r) => ({ resource_type: r.resource_type, resource_id: r.resource_id }))
   }));
 
   res.json(entries);
@@ -71,7 +76,7 @@ router.get('/', async (req, res) => {
 router.post('/', requireRole('coordinador'), async (req, res) => {
   const {
     estado, fecha_inicio, fecha_fin, hora_inicio, hora_fin, unidad, pozo, tipo_unidad,
-    client_id, edp, servicios, assignments, peripheral_ids
+    client_id, edp, servicios, assignments, peripheral_ids, resources
   } = req.body;
 
   const client = await pool.connect();
@@ -89,6 +94,7 @@ router.post('/', requireRole('coordinador'), async (req, res) => {
 
     await replaceAssignments(client, entry.id, assignments);
     await replacePeripherals(client, entry.id, peripheral_ids);
+    await replaceResources(client, entry.id, resources);
 
     await client.query('COMMIT');
     res.status(201).json(entry);
@@ -113,6 +119,20 @@ async function replacePeripherals(client, entryId, peripheralIds) {
   }
 }
 
+// Reemplaza (delete + insert) los recursos adicionales (Unidades de carga, Motocompresor,
+// Generador) elegidos para esta entrada. resources: [{resource_type, resource_id}, ...]
+async function replaceResources(client, entryId, resources) {
+  if (!Array.isArray(resources)) return;
+  await client.query('DELETE FROM daily_board_entry_resources WHERE entry_id = $1', [entryId]);
+  for (const r of resources) {
+    if (!r.resource_type || !r.resource_id) continue;
+    await client.query(
+      'INSERT INTO daily_board_entry_resources (entry_id, resource_type, resource_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+      [entryId, r.resource_type, r.resource_id]
+    );
+  }
+}
+
 // PATCH /api/daily-board/:id - editar cualquier campo (Coordinador/Super)
 const EDITABLE_FIELDS = ['estado', 'fecha_inicio', 'fecha_fin', 'hora_inicio', 'hora_fin', 'unidad', 'pozo', 'tipo_unidad', 'client_id', 'edp', 'servicios'];
 router.patch('/:id', requireRole('coordinador'), async (req, res) => {
@@ -126,7 +146,8 @@ router.patch('/:id', requireRole('coordinador'), async (req, res) => {
   });
   const hasAssignments = Array.isArray(req.body.assignments);
   const hasPeripherals = Array.isArray(req.body.peripheral_ids);
-  if (setClauses.length === 0 && !hasAssignments && !hasPeripherals) {
+  const hasResources = Array.isArray(req.body.resources);
+  if (setClauses.length === 0 && !hasAssignments && !hasPeripherals && !hasResources) {
     return res.status(400).json({ error: 'Nada para actualizar.' });
   }
 
@@ -153,6 +174,9 @@ router.patch('/:id', requireRole('coordinador'), async (req, res) => {
     }
     if (hasPeripherals) {
       await replacePeripherals(client, req.params.id, req.body.peripheral_ids);
+    }
+    if (hasResources) {
+      await replaceResources(client, req.params.id, req.body.resources);
     }
 
     if (!entry) {
@@ -250,6 +274,17 @@ router.post('/:id/duplicate', requireRole('coordinador'), async (req, res) => {
       await client.query('INSERT INTO daily_board_entry_peripherals (entry_id, option_id) VALUES ($1, $2)', [newEntry.id, p.option_id]);
     }
 
+    const resourcesToCopy = await client.query(
+      'SELECT resource_type, resource_id FROM daily_board_entry_resources WHERE entry_id = $1',
+      [id]
+    );
+    for (const r of resourcesToCopy.rows) {
+      await client.query(
+        'INSERT INTO daily_board_entry_resources (entry_id, resource_type, resource_id) VALUES ($1, $2, $3)',
+        [newEntry.id, r.resource_type, r.resource_id]
+      );
+    }
+
     await client.query('COMMIT');
 
     const assignmentsWithNames = await pool.query(`
@@ -266,12 +301,18 @@ router.post('/:id/duplicate', requireRole('coordinador'), async (req, res) => {
       WHERE entry_id = $1
     `, [newEntry.id]);
 
+    const resourcesForNewEntry = await pool.query(
+      'SELECT resource_type, resource_id FROM daily_board_entry_resources WHERE entry_id = $1',
+      [newEntry.id]
+    );
+
     res.status(201).json({
       ...newEntry,
       assignments: assignmentsWithNames.rows.map((a) => ({
         id: a.id, role: a.role, turno: a.turno, personnel_id: a.personnel_id, name: a.personnel_name || a.text_fallback
       })),
       peripherals: peripheralsWithNames.rows.map((p) => ({ option_id: p.option_id, name: p.option_name })),
+      resources: resourcesForNewEntry.rows,
       comments: []
     });
   } catch (err) {
